@@ -1,18 +1,61 @@
 
-#![allow(dead_code)]
+//! Library for reading and writing SAC files
+//!
+//! SAC - Seismic Analysis Code
+//!
+//! Reference: http://ds.iris.edu/files/sac-manual/
+//!
 
-use std::mem;
-use std::slice;
+extern crate fft;
+extern crate num_complex;
+extern crate num_traits;
+#[macro_use] extern crate failure;
+#[macro_use] extern crate failure_derive;
+extern crate byteorder;
+
+extern crate filter;
+
 use std::fs::File;
-use std::error::Error;
-use std::path::PathBuf;
+use std::io::BufReader;
+use std::io::BufWriter;
+use std::path::Path;
 use std::io::prelude::*;
 
-#[macro_export]
+use failure::Error;
+use byteorder::{BigEndian, LittleEndian, WriteBytesExt, ReadBytesExt, NativeEndian};
+
+mod enums;
+use enums::*;
+
+pub mod spec;
+pub use spec::Spectral;
+pub mod functions;
+pub use functions::Functions;
+pub mod time;
+pub use time::Ops;
+pub use time::Math;
+pub use time::Taper;
+pub use time::RMS;
+pub use time::Calculus;
+pub mod xfilter;
+pub use xfilter::Filter;
+
+#[cfg(target_endian = "big")]
+type NonNativeEndian = LittleEndian;
+#[cfg(target_endian = "big")]
+type __NativeEndian = BigEndian;
+
+#[cfg(target_endian = "little")]
+type NonNativeEndian = BigEndian;
+#[cfg(target_endian = "little")]
+type __NativeEndian = LittleEndian;
+
+
 macro_rules! sac_reals {
-    ($s:ident, $function:ident) => { sac_reals!($s, ignore_idnet, $function); };
-    ($s:ident, $z:ident, $function:ident) => {
-        $function!($s,$z,
+    ($s:ident, $function:ident) => { sac_reals!($s, ignore_idnet, ignore_type, $function); };
+    ($s:ident, $z:ident, $function:ident) => { sac_reals!($s, $z, ignore_type, $function); };
+    ($s:ident, $z:ident, $t:ty, $function:ident) => {
+        $function!($s,$z,$t,
                    delta, depmin, depmax, scale, odelta, b, e, o, a, fmt,
                    t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, f,
                    resp0, resp1, resp2, resp3, resp4,
@@ -31,9 +74,10 @@ macro_rules! sac_reals {
 
 
 macro_rules! sac_ints {
-    ($s:ident, $function:ident) => { sac_ints!($s, ignore_idnet, $function); };
-    ($s:ident, $z:ident, $function:ident) => {
-        $function!($s,$z,
+    ($s:ident, $function:ident) => { sac_ints!($s, ignore_idnet, ignore_type, $function); };
+    ($s:ident, $z:ident, $function:ident) => { sac_ints!($s, $z, ignore_type, $function); };
+    ($s:ident, $z:ident, $t:ty, $function:ident) => {
+        $function!($s,$z,$t,
                    nzyear, nzjday, nzhour, nzmin, nzsec, nzmsec, nvhdr,
                    norid, nevid, npts, nsnpts, nwfid,
                    nxsize, nysize, unused15, iftype, idep, iztype,
@@ -52,17 +96,18 @@ macro_rules! sac_strings {
         $function!($s,$x,
                    kstnm, kevnm, khole, ko, ka,
                    kt0, kt1, kt2, kt3, kt4, kt5, kt6, kt7, kt8, kt9,
-                   kuser0, kuser1, kuser2, kcmpnm, knetwk, kdatrd, kinst);
+                   kf, kuser0, kuser1, kuser2, kcmpnm, knetwk, kdatrd, kinst);
     }
 }
 
 macro_rules! sac_u8_strings {
-    ($s:ident, $function:ident) => {
-        $function!($s,
-                   u8_kstnm, u8_khole, u8_ko, u8_ka,
+    ($s:ident, $function:ident) => { sac_u8_strings!($s, ignore_ident, $function); };
+    ($s:ident, $z:ident, $function:ident) => {
+        $function!($s,$z,
+                   u8_kstnm, u8_kevnm, u8_khole, u8_ko, u8_ka,
                    u8_kt0, u8_kt1, u8_kt2, u8_kt3, u8_kt4,
                    u8_kt5, u8_kt6, u8_kt7, u8_kt8, u8_kt9,
-                   u8_kuser0, u8_kuser1, u8_kuser2, u8_kcmpnm,
+                   u8_kf, u8_kuser0, u8_kuser1, u8_kuser2, u8_kcmpnm,
                    u8_knetwk, u8_kdatrd, u8_kinst);
     }
 }
@@ -71,12 +116,11 @@ macro_rules! sac_u8_strings {
 macro_rules! string_to_u8 {
     ($s:ident, $($a:ident, $b:ident),*) => {
         $(
-            let mut tmp : String;
-            if $s.$b.len() == 8 {
-                tmp = format!("{:8}", $s.$a);
+            let mut tmp = if $s.$b.len() == 8 {
+                format!("{:8}", $s.$a)
             } else {
-                tmp = format!("{:16}", $s.$a);
-            }
+                format!("{:16}", $s.$a)
+            };
             tmp.truncate($s.$b.len());
             if tmp.trim_right().len() == 0 {
                 tmp = format!("{:8}", "-12345");
@@ -93,6 +137,7 @@ macro_rules! sac_strings_pair {
                    ko, u8_ko, ka, u8_ka,
                    kt0, u8_kt0, kt1, u8_kt1, kt2, u8_kt2, kt3, u8_kt3, kt4, u8_kt4,
                    kt5, u8_kt5, kt6, u8_kt6, kt7, u8_kt7, kt8, u8_kt8, kt9, u8_kt9,
+                   kf, u8_kf,
                    kuser0, u8_kuser0, kuser1, u8_kuser1, kuser2, u8_kuser2,
                    kcmpnm, u8_kcmpnm, knetwk,  u8_knetwk, kdatrd, u8_kdatrd,
                    kinst, u8_kinst
@@ -100,253 +145,292 @@ macro_rules! sac_strings_pair {
     }
 }
 
-macro_rules! swap_reals {
-    ($s:ident, $empty:ident, $($x:ident),*) => ( $( $s.$x = swap_f32($s.$x); )* );
+macro_rules! copy_values {
+    ($s:ident, $from:ident, $t:ty, $($x:ident),*) => ( $($s.$x = $from.$x;  )* );
 }
-macro_rules! swap_ints {
-    ($s:ident, $empty:ident, $($x:ident),*) => ( $( $s.$x = $s.$x.swap_bytes(); )* );
+macro_rules! clone_values {
+    ($s:ident, $from:ident, $($x:ident),*) => ( $($s.$x = $from.$x.clone();  )* );
+}
+macro_rules! write_real {
+    ($s:ident, $fp:ident, $t:ty, $x:ident) => ( $fp.write_f32::<$t>($s.$x)?; );
+}
+macro_rules! write_reals {
+    ($s:ident, $fp:ident, $t:ty, $($x:ident),+) => ( $( write_real!($s,$fp,$t,$x); )+ );
+}
+macro_rules! write_int {
+    ($s:ident, $fp:ident, $t:ty, $x:ident) => ( $fp.write_i32::<$t>($s.$x)?; );
+}
+macro_rules! write_ints {
+    ($s:ident, $fp:ident, $t:ty, $($x:ident),+) => ( $( write_int!($s,$fp,$t,$x); )+ );
+}
+macro_rules! read_real {
+    ($s:ident, $fp:ident, $t:ty, $x:ident) => ( $s.$x = $fp.read_f32::<$t>()?; );
+}
+macro_rules! read_reals {
+    ($s:ident, $fp:ident, $t:ty, $($x:ident),+) => ( $( read_real!($s,$fp,$t,$x); )+ );
+}
+macro_rules! read_int {
+    ($s:ident, $fp:ident, $t:ty, $x:ident) => ( $s.$x = $fp.read_i32::<$t>()?; );
+}
+macro_rules! read_ints {
+    ($s:ident, $fp:ident, $t:ty, $($x:ident),+) => ( $( read_int!($s,$fp,$t,$x); )+ );
+}
+macro_rules! read_strings {
+    ($s:ident, $fp:ident, $($x:ident),+) => ( $( $fp.read_exact(&mut $s.$x)?; )+ );
+}
+macro_rules! write_strings {
+    ($s:ident, $fp:ident, $($x:ident),+) => ( $( $fp.write_all(&$s.$x)?; )+ );
 }
 
-//use std::str::from_utf8;
 macro_rules! u8_to_string {
     ($s:ident, $($x:ident, $u8x:ident),*) => (
         $( $s.$x = String::from_utf8($s.$u8x.to_vec()).unwrap(); )*
     );
 }
 
+const SAC_INT_UNDEF : i32 = -12345;
+const SAC_FLOAT_UNDEF : f32 = -12345.0;
+
 macro_rules! f32_undef {
-    ($s:ident, $q:ident, $($x:ident),*) => ( $( $s.$x = -12345.0; )* );
+    ($s:ident, $q:ident, $t:ty, $($x:ident),*) => ( $( $s.$x = SAC_FLOAT_UNDEF; )* );
 }
 macro_rules! i32_undef {
-    ($s:ident, $q:ident, $($x:ident),*) => ( $( $s.$x = -12345; )* );
+    ($s:ident, $q:ident, $t:ty, $($x:ident),*) => ( $( $s.$x = SAC_INT_UNDEF; )* );
 }
 macro_rules! str_undef {
     ($s:ident, $q:ident, $($x:ident),*) => ( $( $s.$x = String::from("-12345  "); )* );
 }
 macro_rules! u8s_undef {
-    ($s:ident, $($x:ident),*) => ( $( $s.$x = [45,49,50,51,52,53,32,32]; )* );
-}
-macro_rules! u8_to_str {
-    ($s:ident, $u8x:ident) => ( from_utf8(&$s.$u8x).unwrap(); );
+    ($s:ident, $q:ident, $($x:ident),*) => ( $(
+        for i in 0 .. $s.$x.len() {
+            $s.$x[i] = 32;
+        }
+        $s.$x[0] = 45;
+        $s.$x[1] = 49;
+        $s.$x[2] = 50;
+        $s.$x[3] = 51;
+        $s.$x[4] = 52;
+        $s.$x[5] = 53;
+    )* );
 }
 
-fn sac_u8_to_strings(s: &mut sac) {
+fn sac_u8_to_strings(s: &mut Sac) {
     sac_strings_pair!(s, u8_to_string);
 }
 
-fn sac_strings_to_u8(s: &mut sac) {
+fn sac_strings_to_u8(s: &mut Sac) {
     sac_strings_pair!(s, string_to_u8);
 }
 
-fn swap_f32(x: f32) -> f32 {
-    use std::mem::transmute;
-    let y : f32;
-    unsafe {
-        let mut b : u32 = transmute(x);
-        b = b.swap_bytes();
-        y = transmute(b);
-    }
-    return y;
-}
-
-fn sac_data_swap(h: &mut sac) {
-    //let mut y = h.y;
-    for v in h.y.iter_mut() {
-        *v = swap_f32(*v);
-    }
-}
-
-fn sac_header_swap(h: &mut sac)  {
-    sac_reals!( h, swap_reals );
-    sac_ints!(  h, swap_ints  );
-}
-
-fn struct_to_u8(s: &mut sac, hsize: usize) -> &mut [u8] {
-    return unsafe { slice::from_raw_parts_mut(s as *mut _ as *mut u8, hsize) };
-}
-fn vec_to_u8(y: &mut Vec<f32>, hsize: usize) -> &mut [u8] {
-    return unsafe { slice::from_raw_parts_mut(y.as_mut_ptr() as *mut u8, hsize) };
-}
-
-fn sac_data_read(file: &mut File, h: &mut sac) {
-        /* Create a vector with capacity */
-    let npts = h.npts as usize;
-    let hsize : usize = npts * mem::size_of::<f32>();
-    h.y = vec![0.0; npts];
-    let buffer = vec_to_u8(&mut h.y, hsize);
-    file.read_exact(buffer).unwrap();
-}
-
-fn sac_data_write(file: &mut File, s: &mut sac, npts: usize) {
-    let hsize : usize = npts * mem::size_of::<f32>();
-    let hslice = vec_to_u8(&mut s.y, hsize);
-    file.write_all(hslice).unwrap();
-}
-
-const HEADER_SIZE : usize = 632;
-fn sac_header_read(file: &mut File, h: &mut sac) {
-    let hslice = struct_to_u8(h, HEADER_SIZE);
-    file.read_exact(hslice).unwrap();
-}
-
-fn sac_header_write(file: &mut File, s: &mut sac) {
-    let hslice = struct_to_u8(s, HEADER_SIZE);
-    file.write_all(hslice).unwrap();
-}
-
-fn sac_new() -> sac {
-    let mut s0 : sac = unsafe {mem::zeroed()};
-    sac_reals!(s0, f32_undef);
-    sac_ints!(s0,  i32_undef);
-    sac_strings!(s0, str_undef);
-    sac_u8_strings!(s0, u8s_undef);
-    s0.u8_kevnm = [45,49,50,51,52,53,32,32,
-                   32,32,32,32,32,32,32,32];
-    s0.nvhdr  = 6;
-    return s0;
-}
-
-fn sac_create_file(path: PathBuf) -> File {
-    let display = path.as_path().display();
-    let file : File = match File::create(&path) {
-        Err(why) => panic!("couldn't create {}: {}", display, why.description()),
-        Ok(file) => file,
-    };
-    return file;
-}
-
-fn sac_open_file(path: PathBuf) -> File {
-    let display = path.as_path().display();
-    let file : File = match File::open(&path) {
-        Err(why) => panic!("couldn't open {}: {}", display, why.description()),
-        Ok(file) => file,
-    };
-    return file;
-}
-
-fn sac_read(path: PathBuf) -> sac {
-    let mut h = sac_new();
-    let mut file = sac_open_file(path);
-    sac_header_read(&mut file, &mut h);
-
-    h.swap = false;
-    if h.nvhdr != 6  {
-        if h.nvhdr.swap_bytes() != 6 {
-            panic!("Unknown file type");
-        }
-        h.swap = true;
-        sac_header_swap(&mut h);
-    }
-
-    sac_u8_to_strings(&mut h);
-
-    sac_data_read(&mut file, &mut h);
-    if h.swap {
-        sac_data_swap(&mut h);
-    }
-    return h;
-}
-
-
-fn sac_write(s: &mut sac, path: PathBuf) {
-    let mut file = sac_create_file(path);
-    let npts = s.npts as usize;
-    sac_strings_to_u8(s);
-    if s.swap {
-        let mut s0 = s.clone();
-        sac_data_swap(&mut s0);
-        sac_header_swap(&mut s0);
-        sac_header_write(&mut file, &mut s0);
-        sac_data_write(&mut file, &mut s0, npts);
+fn sac_data_read_comp<T: Read>(file: &mut T, swap: bool, npts: usize) -> Result<Vec<f32>,Error>{
+    let mut y = vec![0.0; npts];
+    if swap {
+        file.read_f32_into::<NonNativeEndian>(&mut y)?;
     } else {
-        sac_header_write(&mut file, s);
-        sac_data_write(&mut file, s, npts);
+        file.read_f32_into::<NativeEndian>(&mut y)?;
     }
+    Ok(y)
+}
+fn sac_data_read<T: Read>(file: &mut T, h: &mut Sac) -> Result<(),Error>{
+    let npts = h.npts as usize;
+    h.y = sac_data_read_comp(file, h.swap, npts)?;
+    if h.ncomps() == 2 {
+        h.x = sac_data_read_comp(file, h.swap, npts)?;
+    }
+    Ok(())
 }
 
-//h.kstnm = String::from_utf8(h._kstnm.to_vec()).unwrap();
-//println!("kstnm >{0}<", from_utf8(&h.u8_kstnm).unwrap());
-//println!("kstnm >{0}<", u8_to_str!(h, u8_kstnm));
-//println!("kstnm >{0}<", String::from_utf8(h.u8_kstnm.to_vec()).unwrap());
-//println!("kstnm >{0}<", h.kstnm);
+fn sac_data_write<F: Write>(file: &mut F, s: &mut Sac, npts: usize) -> Result<(),Error> {
+    if npts != s.y.len() {
+        panic!("Inconsistent Data: npts [{}] != data len [{}]", npts, s.y.len());
+    }
+    if s.swap {
+        s.y.iter().map(|&y| file.write_f32::<NonNativeEndian>(y))
+            .collect::<Result<Vec<()>,_>>()?;
+    } else {
+        s.y.iter().map(|&y| file.write_f32::<NativeEndian>(y))
+            .collect::<Result<Vec<()>,_>>()?;
+    }
+    Ok(())
+}
 
+macro_rules! ri32 {
+    ($file: expr, $t: tt) => ( $file.read_i32::<$t>()? )
+}
+
+fn sac_header_is_swapped<T: Read + Seek>(file: &mut T) -> Result<bool,Error> {
+    use std::io::SeekFrom;
+    file.seek(SeekFrom::Start(70*4 + 6*4))?;
+    let n = ri32!(file, NativeEndian);
+
+    let swap = if n > 5 && n <= 8 {
+        false
+    } else {
+        file.seek(SeekFrom::Start(70*4 + 6*4))?;
+        let n = ri32!(file, NonNativeEndian);
+        if n < 0 || n > 10 {
+            panic!("Unknown file type: {}", n);
+        }
+        true
+    };
+    file.seek(SeekFrom::Start(0))?;
+
+    Ok(swap)
+}
+//const HEADER_SIZE : usize = 632;
+
+
+fn sac_header_read<T: Read + Seek>(file: &mut T, h: &mut Sac) -> Result<(),Error>{
+    use std::io::SeekFrom;
+
+    h.swap = sac_header_is_swapped(file)?;
+    file.seek(SeekFrom::Start(0))?;
+
+    if h.swap {
+        sac_reals!(h, file, NonNativeEndian, read_reals );
+        sac_ints!(h, file, NonNativeEndian, read_ints);
+    } else {
+        sac_reals!(h, file, NativeEndian, read_reals );
+        sac_ints!(h, file, NativeEndian, read_ints);
+    }
+    sac_u8_strings!(h, file, read_strings);
+    Ok(())
+}
+
+fn sac_header_write<F: Write>(file: &mut F, s: &mut Sac) -> Result<(),Error>{
+
+    if s.swap {
+        sac_reals!(s, file, NonNativeEndian, write_reals );
+        sac_ints!(s, file, NonNativeEndian, write_ints);
+    } else {
+        sac_reals!(s, file, NativeEndian, write_reals );
+        sac_ints!(s, file, NativeEndian, write_ints);
+    }
+    sac_u8_strings!(s, file, write_strings);
+    Ok(())
+}
 
 macro_rules! xeq {
-    ($a:ident,$b:ident,$($x:ident),*) => {
+    ($a:ident,$b:ident,$t:ty,$($x:ident),*) => {
         $( if $a.$x != $b.$x {
-            println!("a != b :: {} a: {} b: {}", stringify!($x),$a.$x, $b.$x);
+            println!("field {}:  {} != {}", stringify!($x),$a.$x, $b.$x);
+            return false;
+        } )*
+    };
+}
+macro_rules! xeqf {
+    ($a:ident,$b:ident,$t:ty,$($x:ident),*) => {
+        $( if ($a.$x - $b.$x).abs() > 1e-5 {
+            let dx = ($a.$x - $b.$x).abs();
+            println!("field {}: {} != {} [{}]", stringify!($x),$a.$x, $b.$x, dx);
             return false;
         } )*
     };
 }
 
-impl PartialEq for sac {
-    fn eq(&self, other: &sac) -> bool {
-        sac_ints!(self, other, xeq);
-        sac_strings!(self, other, xeq);
-        sac_reals!(self, other, xeq);
+fn veq(a: &[f32], b: &[f32], tol: f32) -> bool {
+    if a.len() != b.len() {
+        println!("Data Lenghts unequal: {} vs {}", a.len(), b.len());
+        return false;
+    }
+    if a != b {
+        for i in 0 .. a.len() {
+            println!("{:6} {:21.15e} {:21.15e} {:21.15e}", i, a[i], b[i], (a[i]-b[i]).abs());
+            if (a[i] - b[i]).abs() > tol {
+                println!("{}: {} {} tol: {}", i, a[i], b[i], tol);
+                return false;
+            }
+        }
         return true;
+    }
+    true
+}
+
+impl PartialEq for Sac {
+    fn eq(&self, other: &Sac) -> bool {
+        //println!("eq ints");
+        sac_ints!(self,    other, xeq);
+        //println!("eq strings");
+        sac_strings!(self, other, xeq);
+        //println!("eq reals");
+        sac_reals!(self,   other, xeqf);
+        //println!("eq npts");
+        if self.npts != other.npts {
+            println!("npts not equal {} {}",self.npts, other.npts);
+            return false;
+        }
+        //println!("y len");
+        if self.y.len() != other.y.len() {
+            println!("npts not equal in vec, :/ {} {}", self.y.len(), other.y.len());
+            return false;
+        }
+        //println!("y compare {}", self.y.len());
+        veq(&self.y, &other.y, 1e-5) &&
+            veq(&self.x, &other.x, 1e-5)
     }
 }
 
 use std::fmt;
-impl fmt::Debug for sac {
+impl fmt::Debug for Sac {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "sac {{ file: {}, npts: {} }}", self.file, self.npts)
     }
 }
 
-pub enum SacFileType {
-    Real          = 0,
-    Time          = 1,
-    RealImaginary = 2,
-    AmpPhase      = 3,
-    XY            = 4,
-    IXYZ          = 51,
-}
 
-pub enum SacZeroTime {
-    B   = 9,
-    Day = 10,
-    O   = 11,
-    A   = 12,
-    T0  = 13,
-    T1  = 14,
-    T2  = 15,
-    T3  = 16,
-    T4  = 17,
-    T5  = 18,
-    T6  = 19,
-    T7  = 20,
-    T8  = 21,
-    T9  = 22,
-}
+#[derive(Fail, Debug)]
+#[fail(display = "Operation attempted on a non-spectral data type.")]
+pub struct NotSpectral;
+#[derive(Fail, Debug)]
+#[fail(display = "Operation attempted on a non-temporal data type.")]
+pub struct NotTime;
+#[derive(Fail, Debug)]
+#[fail(display = "Encountered NaN Value.")]
+pub struct NaN;
 
-pub enum SacEventType {
-    NuclearShot       = 37,
-    NuclearPreShot    = 38,
-    NuclearPostShot   = 39,
-    Earthquake        = 40,
-    Foreshock         = 41,
-    Aftershock        = 42,
-    ChemicalExplosion = 43,
-    Other             = 44,
-    QuarryBlast       = 72,
-    QuarryBlast1      = 73,
-    QuarryBlast2      = 74,
-}
+impl Sac {
+    pub fn is_time(&self) -> Result<(), Error> {
+        match self.iftype.into() {
+            SacFileType::Time |
+            SacFileType::XY |
+            SacFileType::XYZ  => Ok(()),
+            SacFileType::AmpPhase |
+            SacFileType::RealImag => Err(NotTime.into()),
+        }
+    }
+    pub fn is_spectral(&self) -> Result<(),Error> {
+        match self.iftype.into() {
+            SacFileType::Time |
+            SacFileType::XY |
+            SacFileType::XYZ  => Err(NotSpectral.into()),
+            SacFileType::AmpPhase |
+            SacFileType::RealImag => Ok(()),
+        }
+    }
+    pub fn is_realimag(&self) -> bool {
+        self.iftype == SacFileType::RealImag.into()
+    }
+    pub fn is_ampphase(&self) -> bool {
+        self.iftype == SacFileType::AmpPhase.into()
+    }
 
-pub enum SacDataType {
-    Displacement = 6,
-    Velocity     = 7,
-    Acceleration = 8,
-    Volts        = 50,
-}
+    /// Determine the number of data components
+    pub fn ncomps(&self) -> usize {
+        match self.iftype.into() {
+            SacFileType::Time |
+            SacFileType::XY => {
+                if self.is_even() { 1 } else { 2 }
+            },
+            SacFileType::XYZ => 1,
+            SacFileType::RealImag |
+            SacFileType::AmpPhase => 2,
+        }
+    }
 
-impl sac {
+    /// Set Refernce Time
     pub fn set_time(&mut self,
-                year: i32, oday: i32, hour: i32,
-                min: i32, sec: i32, msec: i32) {
+                    year: i32, oday: i32, hour: i32,
+                    min: i32, sec: i32, msec: i32) {
         self.nzyear = year;
         self.nzjday = oday;
         self.nzhour = hour;
@@ -354,105 +438,148 @@ impl sac {
         self.nzsec  = sec;
         self.nzmsec = msec;
     }
-    pub fn read(path: PathBuf) -> sac {
-        return sac_read(path);
+    /// Read a SAC file
+    pub fn read<T: AsRef<Path>>(path: T) -> Result<Sac,Error> {
+        let file = File::open(path)?;
+        let mut file = BufReader::new(file);
+        let mut s = Sac::new();
+        sac_header_read(&mut file, &mut s)?;
+        sac_u8_to_strings(&mut s);
+        sac_data_read(&mut file, &mut s)?;
+        Ok(s)
     }
-    pub fn write(&mut self, path: PathBuf) {
-        return sac_write(self, path);
+    /// Write a SAC file
+    pub fn write<T: AsRef<Path>>(&mut self, path: T) -> Result<(),Error>{
+        let file = File::create(path)?;
+        let mut file = BufWriter::new(file);
+        let npts = self.npts as usize;
+        sac_strings_to_u8(self);
+        sac_header_write(&mut file, self)?;
+        sac_data_write(&mut file, self, npts)?;
+        Ok(())
     }
-    pub fn new() -> sac {
-        sac_new()
+    /// Create an empty SAC file
+    pub fn new() -> Sac {
+        let mut s0 : Sac = Sac { .. Default::default() };
+        sac_reals!(s0, f32_undef);
+        sac_ints!(s0,  i32_undef);
+        sac_strings!(s0, str_undef);
+        sac_u8_strings!(s0, u8s_undef);
+        s0.iztype   = SacZeroTime::None.into();
+        s0.iftype   = SacFileType::Time.into();
+        s0.ievtyp   = SacEventType::None.into();
+        s0.idep     = SacDataType::None.into();
+        s0.nvhdr    = 6;
+        s0.lpspol   = 0;
+        s0.lovrok   = 1;
+        s0.lcalda   = 1;
+        s0.unused27 = 0;
+        s0.y = vec![];
+        s0.x = vec![];
+        s0
     }
+    /// Compute the maximum amplitude
     pub fn max_amp(&self) -> f32 {
         let mut vmax = self.y[0];
         for v in self.y.iter() { if *v > vmax { vmax = *v; } }
         vmax
     }
+    /// Compute the minimum amplitude
     pub fn min_amp(&self) -> f32 {
         let mut vmin = self.y[0];
         for v in self.y.iter() { if *v < vmin { vmin = *v; } }
         vmin
     }
+    /// Compute the mean amplitude
     pub fn mean_amp(&self) -> f32 {
-        let mut vmean : f64 = 0.0;
-        for v in self.y.iter() { vmean = vmean + (*v as f64); }
-        (vmean / (self.npts as f64)) as f32
+        let vmean : f64 = self.y.iter().map(|x| *x as f64).sum();
+        (vmean / self.npts as f64) as f32
     }
+    /// Compute and set min, man and mean amplitudes
     pub fn extrema_amp(&mut self) {
         self.depmax = self.max_amp();
         self.depmin = self.min_amp();
         self.depmen = self.mean_amp();
     }
+    /// Compute and set extremas in time and amplitude
     pub fn extrema(&mut self) {
         self.extrema_amp();
         self.e = self.b + self.delta * ((self.npts-1) as f32);
     }
-    pub fn from_amp_with_name(y: Vec<f32>, b: f32, dt: f32, file: &str) -> sac {
-        let mut s = sac::from_amp(y, b, dt);
+    pub fn with_new_data(&self, y: Vec<f32>) -> Self {
+        let mut s = self.clone();
+        s.y = y;
+        s.npts = s.y.len() as i32;
+        s.extrema();
+        s
+    }
+    /// Create new sac file from data and name
+    pub fn from_amp_with_name(y: Vec<f32>, b: f64, dt: f64, file: &str) -> Sac {
+        let mut s = Sac::from_amp(y, b, dt);
         s.file = String::from(file);
         return s;
     }
-    pub fn from_amp(y: Vec<f32>, b: f32, dt: f32) -> sac {
-        let mut s = sac_new();
+    /// Create new sac from data
+    pub fn from_amp(y: Vec<f32>, b: f64, dt: f64) -> Sac {
+        let mut s = Sac::new();
         s.npts   = y.len() as i32;
-        s.delta  = dt;
-        s.b      = b;
+        s.delta  = dt as f32;
+        s.b      = b as f32;
         s.y      = y;
-        s.iztype = SacZeroTime::B as i32;
-        s.iftype = SacFileType::Time as i32;
+        s.iftype = SacFileType::Time.into();
         s.leven  = true as i32;
         s.extrema();
         return s;
     }
-    pub fn exp(&mut self) {
-        for v in self.y.iter_mut() {
-            *v = v.exp();
-        }
-        self.extrema_amp();
+    pub fn copy_header(&mut self, from: &Sac) {
+        sac_reals!(self, from, copy_values );
+        sac_ints!(self, from, copy_values );
+        sac_strings!(self, from, clone_values );
     }
+
+    /// Determine if all data is finite, not NaN, inf
     pub fn is_finite(&self) -> bool {
         self.y.iter().all(|x| x.is_finite() == true)
     }
-    pub fn integrate(&mut self) {
-        let hstep = 0.5 * self.delta;
-        let mut yt = 0.0;
-        let npts = (self.npts - 1) as usize;
-        // Trapezodial Integration
-        {
-            for i in 0 .. npts {
-                let pt = hstep * (self.y[i] + self.y[i+1]);
-                yt = yt + pt;
-                self.y[i] = yt;
-            }
-            self.y.pop(); // Remove Last Point 
-        }
-        self.npts = self.npts - 1;
-        self.extrema();
+
+    pub fn zero_time(&self) -> SacZeroTime {
+        self.iztype.into()
     }
-    pub fn differentiate(&mut self) {
-        // 2-pt Differentiation
-        let factor = 1.0 / self.delta;
-        let npts = (self.npts - 1) as usize;
-        {
-            for i in 0 .. npts {
-                self.y[i] = factor * (self.y[i+1] - self.y[i]);
-            }
-            self.y.pop();
+    pub fn is_even(&self) -> bool {
+        if self.leven == 0 { false } else { true }
+    }
+    pub fn is_dist_az(&self) -> bool {
+        if self.lcalda == 0 { false } else { true }
+    }
+    pub fn calc_dist_az(&mut self, value: bool) {
+        self.lcalda = value as i32;
+    }
+    pub fn is_mutable(&self) -> bool {
+        if self.lovrok == 0 { false } else { true }
+    }
+    pub fn mutable(&mut self) {
+        self.lovrok = true as i32;
+    }
+    pub fn immutable(&mut self) {
+        self.lovrok = false as i32;
+    }
+    pub fn event_type(&self) -> SacEventType {
+        self.ievtyp.into()
+    }
+    pub fn amp_type(&self) -> SacDataType {
+        self.idep.into()
+    }
+    pub fn file_type(&self) -> SacFileType {
+        self.iftype.into()
+    }
+    pub fn fval(&self, key: &str) -> Option<f32> {
+        match key {
+            "a" | "A" => Some(self.a),
+            "f" | "F" => Some(self.f),
+            _ => None
         }
-        self.npts = self.npts - 1;
-        self.extrema();
     }
 }
-
-
-
-/*
-impl Drop for sac {
-    fn drop(&mut self) {
-        println!("> Dropping {:?}", self);
-    }
-}
-*/
 use std::ops;
 
 /* Missing Neg */
@@ -468,8 +595,7 @@ fn f32subi(a:f32,b:f32)->f32 {b-a}
 fn f32muli(a:f32,b:f32)->f32 {b*a}
 fn f32divi(a:f32,b:f32)->f32 {b/a}
 
-/* F32 op SAC */
-fn sac_op_sac<F>(s1: sac, s2: sac, f: F) -> sac where F: Fn(f32,f32) -> f32 {
+fn sac_op_sac<F>(s1: Sac, s2: Sac, f: F) -> Sac where F: Fn(f32,f32) -> f32 {
     let mut s = s1.clone();
     let npts = s.npts as usize;
     for i in 0 .. npts {
@@ -478,7 +604,7 @@ fn sac_op_sac<F>(s1: sac, s2: sac, f: F) -> sac where F: Fn(f32,f32) -> f32 {
     s.extrema_amp();
     return s;
 }
-fn sac_op_f32<F>(x: sac, fval: f32, f: F) -> sac where F: Fn(f32,f32) -> f32 {
+fn sac_op_f32<F>(x: Sac, fval: f32, f: F) -> Sac where F: Fn(f32,f32) -> f32 {
     let mut s = x.clone();
     for v in s.y.iter_mut() {
         *v = f(*v, fval);
@@ -487,76 +613,90 @@ fn sac_op_f32<F>(x: sac, fval: f32, f: F) -> sac where F: Fn(f32,f32) -> f32 {
     return s;
 }
 
-impl ops::Add<sac> for f32 {    type Output = sac;
-    fn add(self, x: sac) -> sac { sac_op_f32(x, self, f32addi) }
+impl ops::Add<Sac> for f32 {    type Output = Sac;
+    fn add(self, x: Sac) -> Sac { sac_op_f32(x, self, f32addi) }
 }
-impl ops::Sub<sac> for f32 {    type Output = sac;
-    fn sub(self, x: sac) -> sac { sac_op_f32(x, self, f32subi) }
+impl ops::Sub<Sac> for f32 {    type Output = Sac;
+    fn sub(self, x: Sac) -> Sac { sac_op_f32(x, self, f32subi) }
 }
-impl ops::Mul<sac> for f32 {    type Output = sac;
-    fn mul(self, x: sac) -> sac { sac_op_f32(x, self, f32muli) }
+impl ops::Mul<Sac> for f32 {    type Output = Sac;
+    fn mul(self, x: Sac) -> Sac { sac_op_f32(x, self, f32muli) }
 }
-impl ops::Div<sac> for f32 {    type Output = sac;
-    fn div(self, x: sac) -> sac { sac_op_f32(x, self, f32divi) }
+impl ops::Div<Sac> for f32 {    type Output = Sac;
+    fn div(self, x: Sac) -> Sac { sac_op_f32(x, self, f32divi) }
 }
 
 /* OP ASSIGN */
-impl ops::AddAssign<f32> for sac {
-    fn add_assign(&mut self, x: f32) { *self = self.clone() + x; }
+impl ops::AddAssign<f32> for Sac {
+    fn add_assign(&mut self, x: f32) {
+        self.y.iter_mut().for_each(|y| *y += x);
+    }
 }
-impl ops::SubAssign<f32> for sac {
-    fn sub_assign(&mut self, x: f32) { *self = self.clone() - x; }
+impl ops::SubAssign<f32> for Sac {
+    fn sub_assign(&mut self, x: f32) {
+        self.y.iter_mut().for_each(|y| *y -= x);
+    }
 }
-impl ops::MulAssign<f32> for sac {
-    fn mul_assign(&mut self, x: f32) { *self = self.clone() * x; }
+impl ops::MulAssign<f32> for Sac {
+    fn mul_assign(&mut self, x: f32) {
+        self.y.iter_mut().for_each(|y| *y *= x);
+    }
 }
-impl ops::DivAssign<f32> for sac {
-    fn div_assign(&mut self, x: f32) { *self = self.clone() / x; }
+impl ops::DivAssign<f32> for Sac {
+    fn div_assign(&mut self, x: f32) {
+        match self.iftype.into() {
+            SacFileType::RealImag => {
+                self.y.iter_mut().for_each(|v| *v /= x);
+                self.x.iter_mut().for_each(|v| *v /= x);
+            },
+            SacFileType::Time |
+            SacFileType::XY |
+            SacFileType::AmpPhase |
+            SacFileType::XYZ => self.y.iter_mut().for_each(|v| *v /= x),
+        }
+    }
 }
 
 /* SAC op SAC */
-impl ops::Add<sac> for sac {    type Output = sac;
-    fn add(self, x: sac) -> sac { sac_op_sac(self, x, f32add) }
+impl ops::Add<Sac> for Sac {    type Output = Sac;
+    fn add(self, x: Sac) -> Sac { sac_op_sac(self, x, f32add) }
 }
-impl ops::Sub<sac> for sac {    type Output = sac;
-    fn sub(self, x: sac) -> sac { sac_op_sac(self, x, f32sub) }
+impl ops::Sub<Sac> for Sac {    type Output = Sac;
+    fn sub(self, x: Sac) -> Sac { sac_op_sac(self, x, f32sub) }
 }
-impl ops::Mul<sac> for sac {    type Output = sac;
-    fn mul(self, x: sac) -> sac { sac_op_sac(self, x, f32mul) }
+impl ops::Mul<Sac> for Sac {    type Output = Sac;
+    fn mul(self, x: Sac) -> Sac { sac_op_sac(self, x, f32mul) }
 }
-impl ops::Div<sac> for sac {    type Output = sac;
-    fn div(self, x: sac) -> sac { sac_op_sac(self, x, f32div) }
+impl ops::Div<Sac> for Sac {    type Output = Sac;
+    fn div(self, x: Sac) -> Sac { sac_op_sac(self, x, f32div) }
 }
 
 /* SAC op F32 */
-impl ops::Add<f32> for sac {    type Output = sac;
-    fn add(self, x: f32) -> sac { sac_op_f32(self, x, f32add) }
+impl ops::Add<f32> for Sac {    type Output = Sac;
+    fn add(self, x: f32) -> Sac { sac_op_f32(self, x, f32add) }
 }
-impl ops::Sub<f32> for sac {    type Output = sac;
-    fn sub(self, x: f32) -> sac { sac_op_f32(self, x, f32sub) }
+impl ops::Sub<f32> for Sac {    type Output = Sac;
+    fn sub(self, x: f32) -> Sac { sac_op_f32(self, x, f32sub) }
 }
-impl ops::Mul<f32> for sac {    type Output = sac;
-    fn mul(self, x: f32) -> sac { sac_op_f32(self, x, f32mul) }
+impl ops::Mul<f32> for Sac {    type Output = Sac;
+    fn mul(self, x: f32) -> Sac { sac_op_f32(self, x, f32mul) }
 }
-impl ops::Div<f32> for sac {    type Output = sac;
-    fn div(self, x: f32) -> sac { sac_op_f32(self, x, f32div) }
+impl ops::Div<f32> for Sac {    type Output = Sac;
+    fn div(self, x: f32) -> Sac { sac_op_f32(self, x, f32div) }
 }
 /* Neg SAC */
-impl ops::Neg for sac { type Output = sac;
-    fn neg(self) -> sac { sac_op_f32(self, -1.0, f32mul) }
+impl ops::Neg for Sac { type Output = Sac;
+    fn neg(self) -> Sac { sac_op_f32(self, -1.0, f32mul) }
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn empty() {
-    }
-
-    #[test]
     fn create_time() {
-        let mut s = sac::from_amp(vec![0.,-1.,2.], 0.0, 1.0);
+        let mut s = Sac::from_amp(vec![0.,-1.,2.], 0.0, 1.0);
         s.file = format!("{}","create_time");
         assert_eq!(s.depmin, -1.0);
         assert_eq!(s.depmax,  2.0);
@@ -564,58 +704,43 @@ mod tests {
         assert_eq!(s.delta,   1.0);
         assert_eq!(s.depmen,  1.0/3.0);
         assert_eq!(s.e,       2.0);
-        assert_eq!(s.iztype,  SacZeroTime::B as i32);
-        assert_eq!(s.iftype,  SacFileType::Time as i32);
+        //assert_eq!(s.iztype,  SacZeroTime::B as i32);
+        assert_eq!(s.iftype,  SacFileType::Time.into());
         assert_eq!(s.leven,   true as i32);
         assert_eq!(s.nvhdr,   6);
         assert_eq!(s.y,     vec![0.,-1.,2.0]);
     }
-    #[test]
-    fn test_exp() {
-        let mut s = sac::from_amp_with_name(vec![1.,2.,3.], 0.0, 1.0, "test_exp");
-        s.exp();
-        let v = vec![(1f32).exp(), (2f32).exp(), (3f32).exp()];
-        assert_eq!(s.y, v);
-    }
 
     #[test]
-    fn test_finite() {
-        let s = sac::from_amp_with_name(vec![1.,2.,3.], 0., 1., "finite_ok");
-        assert_eq!(s.is_finite(), true);
-        let s = sac::from_amp_with_name(vec![1.,2.,1./0.], 0., 1., "finite_nan");
-        assert_eq!(s.is_finite(), false);
-        let s = sac::from_amp_with_name(vec![1.,2.,-1./0.], 0., 1., "finite_neg_nan");
-        assert_eq!(s.is_finite(), false);
+    fn test_finite_ok() {
+        let s = Sac::from_amp_with_name(vec![1.,2.,3.], 0., 1., "finite_ok");
+        assert!(s.is_finite())
+    }
+    #[test]
+    fn test_finite_pos_inf() {
+        let s = Sac::from_amp_with_name(vec![1.,2.,1./0.], 0., 1., "finite_nan");
+        assert!(!s.is_finite())
+    }
+    #[test]
+    fn test_finite_neg_inf() {
+        let s = Sac::from_amp_with_name(vec![1.,2.,-1./0.], 0., 1., "finite_neg_nan");
+        assert!(!s.is_finite())
     }
     #[test]
     fn test_neg() {
-        let mut s = sac::from_amp_with_name(vec![1.,2.,3.], 0., 1., "neg");
+        let mut s = Sac::from_amp_with_name(vec![1.,2.,3.], 0., 1., "neg");
         s = -s;
         assert_eq!(s.y, [-1.,-2.,-3.]);
     }
     #[test]
-    fn test_integrate() {
-        let mut s = sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
-        s.file = String::from("test_integrate");
-        s.integrate();
-        assert_eq!(s.y, [1.5, 4.]);
-    }
-    #[test]
-    fn test_differentiate() {
-        let mut s = sac::from_amp_with_name(vec![1.,2.,3.], 0.0, 1.0, "diff");
-        s.differentiate();
-        assert_eq!(s.y, [1.0, 1.0]);
-    }
-
-    #[test]
     fn test_add() {
-        let s = sac::from_amp_with_name(vec![1.,2.,3.], 0.0, 1.0, "add_s #1");
+        let s = Sac::from_amp_with_name(vec![1.,2.,3.], 0.0, 1.0, "add_s #1");
         assert_eq!(s.y, [1.,2.,3.]);
         let mut s1 = s + 1.0;
         s1.file = String::from("test_add_s+1");
         assert_eq!(s1.y, [2.,3.,4.]);
 
-        let mut s = sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
+        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
         s.file = String::from("test_add_s #2");
         assert_eq!(s.y, [1.,2.,3.]);
         let mut s1 = 1.0 + s;
@@ -625,8 +750,8 @@ mod tests {
 
     #[test]
     fn test_add_vec() {
-        let mut s = sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
-        let mut t = sac::from_amp(vec![2.,3.,4.], 0.0, 1.0);
+        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
+        let mut t = Sac::from_amp(vec![2.,3.,4.], 0.0, 1.0);
         s.file = String::from("test_add_vec s");
         t.file = String::from("test_add_vec t");
         assert_eq!(s.y, [1.,2.,3.]);
@@ -634,7 +759,7 @@ mod tests {
         s1.file = String::from("test_add_vec s+t");
         assert_eq!(s1.y, [3.,5.,7.]);
 
-        let mut s = sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
+        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
         s.file = String::from("test_add_vec s clone?");
         let mut s1 = s.clone() + s;
         s1.file = String::from("test_add_vec s1");
@@ -642,7 +767,7 @@ mod tests {
     }
     #[test]
     fn test_sub() {
-        let mut s = sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
+        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
         s.file = String::from("test_sub s");
         assert_eq!(s.y, [1.,2.,3.]);
         let mut s1 = s - 1.0;
@@ -651,7 +776,7 @@ mod tests {
     }
     #[test]
     fn test_mul() {
-        let mut s = sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
+        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
         s.file = String::from("test_mul s");
         assert_eq!(s.y, [1.,2.,3.]);
         let mut s1 = s * 2.0;
@@ -660,7 +785,7 @@ mod tests {
     }
     #[test]
     fn test_div() {
-        let mut s = sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
+        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
         s.file = String::from("test_div s");
         assert_eq!(s.y, [1.,2.,3.]);
         let mut s1 = s / 2.0;
@@ -669,7 +794,7 @@ mod tests {
     }
     #[test]
     fn test_clone() {
-        let mut s = sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
+        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
         s.file = String::from("test_clone s");
         let mut cc = s.clone();
         cc.file = String::from("test_clone cc");
@@ -680,7 +805,7 @@ mod tests {
     }
     #[test]
     fn test_assign_op() {
-        let mut s = sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
+        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
         s.file = String::from("test_clone s");
         s += 1.0;
         assert_eq!(s.y, [2.,3.,4.]);
@@ -695,14 +820,17 @@ mod tests {
     #[test]
     fn read_file() {
         use std::path::Path;
-        let path = Path::new("file.sac.swap");
-        let mut s = sac::read(path.to_path_buf());
-        s.file = String::from("file.sac.swap");
-        let mut s0 = sac::new();
-        s0.file = String::from("file.sac.swap true");
+        let mut s = Sac::read("tests/file.sac.swap").unwrap();
+        s.file = String::from("tests/file.sac.swap");
+
+        let mut s0 = Sac::new();
+        s0.file = String::from("tests/file.sac.swap true");
         s0.set_time(1981, 88, 10, 38, 14, 0);
         s0.norid  = 0;
         s0.nevid  = 0;
+
+        // Wow, this is kinda cheating
+        s0.y = s.y.clone();
 
         s0.lovrok = true as i32;
         s0.lpspol = true as i32;
@@ -711,7 +839,7 @@ mod tests {
         s0.unused27 = false as i32;
 
         s0.npts   = 1000;
-        s0.iftype = SacFileType::Time as i32;
+        s0.iftype = SacFileType::Time.into();
         s0.idep   = SacDataType::Volts as i32;
         s0.iztype = SacZeroTime::B as i32;
         s0.ievtyp = SacEventType::Aftershock as i32;
@@ -739,93 +867,104 @@ mod tests {
         s0.cmpaz  = 0.0;
         s0.cmpinc = 0.0;
 
+        println!("compare s and s0");
         assert_eq!(s,s0);
-
+        println!("write file");
         let path = Path::new("tmp.sac");
-        s.write(path.to_path_buf());
+        s.write(path.to_path_buf()).unwrap();
 
+        println!("write file with long kevnm");
         s.kevnm = format!("{}", "123456789012345678901234567890");
         let path = Path::new("tmp2.sac");
-        s.write(path.to_path_buf());
+        s.write(path.to_path_buf()).unwrap();
 
+        println!("write file with short kevnm");
         s.kevnm = format!("{}", "12");
         let path = Path::new("tmp3.sac");
-        s.write(path.to_path_buf());
-
+        s.write(path.to_path_buf()).unwrap();
         {
             for elem in s.y.iter_mut() {
                 *elem += 1.0;
             }
         }
     }
+
 }
 
-#[derive(Clone)]
+/// SAC file data and metadata
+///
+///
+#[derive(Clone, Default)]
 #[repr(C)]
-pub struct sac {
+pub struct Sac {
+    /// Time sampling
     pub delta: f32,               /* RF time increment, sec    */
+    /// Miniumum Value of y
     pub depmin: f32,               /*    minimum amplitude      */
+    /// Maximum value of y
     pub depmax: f32,               /*    maximum amplitude      */
-    scale: f32,                /*    amplitude scale factor */
-    odelta: f32,               /*    observed time inc      */
+    pub scale: f32,                /*    amplitude scale factor */
+    pub odelta: f32,               /*    observed time inc      */
+    /// Begin time value of the data
     pub b: f32,                    /* RD initial value, time    */
+    /// End time value of the data
     pub e: f32,                    /* RD final value, time      */
-    o: f32,                    /*    event start, sec < nz. */
-    a: f32,                    /*    1st arrival time       */
-    fmt: f32,                  /*    internal use           */
-    t0: f32,                   /*    user-defined time pick */
-    t1: f32,                   /*    user-defined time pick */
-    t2: f32,                   /*    user-defined time pick */
-    t3: f32,                   /*    user-defined time pick */
-    t4: f32,                   /*    user-defined time pick */
-    t5: f32,                   /*    user-defined time pick */
-    t6: f32,                   /*    user-defined time pick */
-    t7: f32,                   /*    user-defined time pick */
-    t8: f32,                   /*    user-defined time pick */
-    t9: f32,                   /*    user-defined time pick */
-    f: f32,                    /*    event end, sec > nz    */
-    resp0: f32,                /*    instrument respnse parm */
-    resp1: f32,                /*    instrument respnse parm */
-    resp2: f32,                /*    instrument respnse parm */
-    resp3: f32,                /*    instrument respnse parm */
-    resp4: f32,                /*    instrument respnse parm */
-    resp5: f32,                /*    instrument respnse parm */
-    resp6: f32,                /*    instrument respnse parm */
-    resp7: f32,                /*    instrument respnse parm */
-    resp8: f32,                /*    instrument respnse parm */
-    resp9: f32,                /*    instrument respnse parm */
-    stla: f32,                 /*  T station latititude     */
-    stlo: f32,                 /*  T station longitude      */
-    stel: f32,                 /*  T station elevation, m   */
-    stdp: f32,                 /*  T station depth, m      */
-    evla: f32,                 /*    event latitude         */
-    evlo: f32,                 /*    event longitude        */
-    evel: f32,                 /*    event elevation        */
-    evdp: f32,                 /*    event depth            */
-    mag: f32,                  /*    reserved for future use */
-    user0: f32,                /*    available to user      */
-    user1: f32,                /*    available to user      */
-    user2: f32,                /*    available to user      */
-    user3: f32,                /*    available to user      */
-    user4: f32,                /*    available to user      */
-    user5: f32,                /*    available to user      */
-    user6: f32,                /*    available to user      */
-    user7: f32,                /*    available to user      */
-    user8: f32,                /*    available to user      */
-    user9: f32,                /*    available to user      */
-    dist: f32,                 /*    stn-event distance, km */
-    az: f32,                   /*    event-stn azimuth      */
-    baz: f32,                  /*    stn-event azimuth      */
-    gcarc: f32,                /*    stn-event dist, degrees */
-    sb: f32,                   /*    internal use           */
-    sdelta: f32,               /*    internal use           */
-    depmen: f32,               /*    mean value, amplitude  */
-    cmpaz: f32,                /*  T component azimuth     */
-    cmpinc: f32,               /*  T component inclination */
-    xminimum: f32,             /*    reserved for future use */
-    xmaximum: f32,             /*    reserved for future use */
-    yminimum: f32,             /*    reserved for future use */
-    ymaximum: f32,             /*    reserved for future use */
+    pub o: f32,                    /*    event start, sec < nz. */
+    pub a: f32,                    /*    1st arrival time       */
+    pub fmt: f32,                  /*    internal use           */
+    pub t0: f32,                   /*    user-defined time pick */
+    pub t1: f32,                   /*    user-defined time pick */
+    pub t2: f32,                   /*    user-defined time pick */
+    pub t3: f32,                   /*    user-defined time pick */
+    pub t4: f32,                   /*    user-defined time pick */
+    pub t5: f32,                   /*    user-defined time pick */
+    pub t6: f32,                   /*    user-defined time pick */
+    pub t7: f32,                   /*    user-defined time pick */
+    pub t8: f32,                   /*    user-defined time pick */
+    pub t9: f32,                   /*    user-defined time pick */
+    pub f: f32,                    /*    event end, sec > nz    */
+    pub resp0: f32,                /*    instrument respnse parm */
+    pub resp1: f32,                /*    instrument respnse parm */
+    pub resp2: f32,                /*    instrument respnse parm */
+    pub resp3: f32,                /*    instrument respnse parm */
+    pub resp4: f32,                /*    instrument respnse parm */
+    pub resp5: f32,                /*    instrument respnse parm */
+    pub resp6: f32,                /*    instrument respnse parm */
+    pub resp7: f32,                /*    instrument respnse parm */
+    pub resp8: f32,                /*    instrument respnse parm */
+    pub resp9: f32,                /*    instrument respnse parm */
+    pub stla: f32,                 /*  T station latititude     */
+    pub stlo: f32,                 /*  T station longitude      */
+    pub stel: f32,                 /*  T station elevation, m   */
+    pub stdp: f32,                 /*  T station depth, m      */
+    pub evla: f32,                 /*    event latitude         */
+    pub evlo: f32,                 /*    event longitude        */
+    pub evel: f32,                 /*    event elevation        */
+    pub evdp: f32,                 /*    event depth            */
+    pub mag: f32,                  /*    reserved for future use */
+    pub user0: f32,                /*    available to user      */
+    pub user1: f32,                /*    available to user      */
+    pub user2: f32,                /*    available to user      */
+    pub user3: f32,                /*    available to user      */
+    pub user4: f32,                /*    available to user      */
+    pub user5: f32,                /*    available to user      */
+    pub user6: f32,                /*    available to user      */
+    pub user7: f32,                /*    available to user      */
+    pub user8: f32,                /*    available to user      */
+    pub user9: f32,                /*    available to user      */
+    pub dist: f32,                 /*    stn-event distance, km */
+    pub az: f32,                   /*    event-stn azimuth      */
+    pub baz: f32,                  /*    stn-event azimuth      */
+    pub gcarc: f32,                /*    stn-event dist, degrees */
+    pub sb: f32,                   /*    internal use           */
+    pub sdelta: f32,               /*    internal use           */
+    pub depmen: f32,               /*    mean value, amplitude  */
+    pub cmpaz: f32,                /*  T component azimuth     */
+    pub cmpinc: f32,               /*  T component inclination */
+    pub xminimum: f32,             /*    reserved for future use */
+    pub xmaximum: f32,             /*    reserved for future use */
+    pub yminimum: f32,             /*    reserved for future use */
+    pub ymaximum: f32,             /*    reserved for future use */
     unused6: f32,              /*    reserved for future use */
     unused7: f32,              /*    reserved for future use */
     unused8: f32,              /*    reserved for future use */
@@ -833,33 +972,35 @@ pub struct sac {
     unused10: f32,             /*    reserved for future use */
     unused11: f32,             /*    reserved for future use */
     unused12: f32,             /*    reserved for future use */
-    nzyear: i32,                 /*  F zero time of file, yr  */
-    nzjday: i32,                 /*  F zero time of file, day */
-    nzhour: i32,                 /*  F zero time of file, hr  */
-    nzmin: i32,                  /*  F zero time of file, min */
-    nzsec: i32,                  /*  F zero time of file, sec */
-    nzmsec: i32,                 /*  F zero time of file, msec */
+    pub nzyear: i32,                 /*  F zero time of file, yr  */
+    pub nzjday: i32,                 /*  F zero time of file, day */
+    pub nzhour: i32,                 /*  F zero time of file, hr  */
+    pub nzmin: i32,                  /*  F zero time of file, min */
+    pub nzsec: i32,                  /*  F zero time of file, sec */
+    pub nzmsec: i32,                 /*  F zero time of file, msec */
+    /// Header Version, Should be 6
     pub nvhdr: i32,                  /*    internal use           */
-    norid: i32,                  /*    origin ID              */
-    nevid: i32,                  /*    event ID               */
+    pub norid: i32,                  /*    origin ID              */
+    pub nevid: i32,                  /*    event ID               */
+    /// Number of data points
     pub npts: i32,                   /* RF number of samples      */
-    nsnpts: i32,                 /*    internal use           */
-    nwfid: i32,                  /*    waveform ID            */
-    nxsize: i32,                 /*    reserved for future use */
-    nysize: i32,                 /*    reserved for future use */
+    pub nsnpts: i32,                 /*    internal use           */
+    pub nwfid: i32,                  /*    waveform ID            */
+    pub nxsize: i32,                 /*    reserved for future use */
+    pub nysize: i32,                 /*    reserved for future use */
     unused15: i32,               /*    reserved for future use */
-    iftype: i32,                 /* RA type of file          */
-    idep: i32,                   /*    type of amplitude      */
-    iztype: i32,                 /*    zero time equivalence  */
+    pub iftype: i32,                 /* RA type of file          */
+    pub idep: i32,                   /*    type of amplitude      */
+    pub iztype: i32,                 /*    zero time equivalence  */
     unused16: i32,               /*    reserved for future use */
-    iinst: i32,                  /*    recording instrument   */
-    istreg: i32,                 /*    stn geographic region  */
-    ievreg: i32,                 /*    event geographic region */
-    ievtyp: i32,                 /*    event type             */
-    iqual: i32,                  /*    quality of data        */
-    isynth: i32,                 /*    synthetic data flag    */
-    imagtyp: i32,                /*    reserved for future use */
-    imagsrc: i32,                /*    reserved for future use */
+    pub iinst: i32,                  /*    recording instrument   */
+    pub istreg: i32,                 /*    stn geographic region  */
+    pub ievreg: i32,                 /*    event geographic region */
+    pub ievtyp: i32,                 /*    event type             */
+    pub iqual: i32,                  /*    quality of data        */
+    pub isynth: i32,                 /*    synthetic data flag    */
+    pub imagtyp: i32,                /*    reserved for future use */
+    pub imagsrc: i32,                /*    reserved for future use */
     unused19: i32,               /*    reserved for future use */
     unused20: i32,               /*    reserved for future use */
     unused21: i32,               /*    reserved for future use */
@@ -868,10 +1009,10 @@ pub struct sac {
     unused24: i32,               /*    reserved for future use */
     unused25: i32,               /*    reserved for future use */
     unused26: i32,               /*    reserved for future use */
-    leven: i32,                  /* RA data-evenly-spaced flag */
-    lpspol: i32,                 /*    station polarity flag  */
-    lovrok: i32,                 /*    overwrite permission   */
-    lcalda: i32,                 /*    calc distance, azimuth */
+    pub leven: i32,                  /* RA data-evenly-spaced flag */
+    pub lpspol: i32,                 /*    station polarity flag  */
+    pub lovrok: i32,                 /*    overwrite permission   */
+    pub lcalda: i32,                 /*    calc distance, azimuth */
     unused27: i32,               /*    reserved for future use */
 
     u8_kstnm: [u8; 8],              /*  F station name           */
@@ -898,34 +1039,48 @@ pub struct sac {
     u8_kdatrd: [u8; 8],             /*    date data read         */
     u8_kinst: [u8; 8],              /*    instrument name        */
 
-    kstnm: String,              /*  F station name           */
-    kevnm: String,             /*    event name             */
-    khole: String,              /*    man-made event name    */
-    ko: String,                 /*    event origin time id   */
-    ka: String,                 /*    1st arrival time ident */
-    kt0: String,                /*    time pick 0 ident      */
-    kt1: String,                /*    time pick 1 ident      */
-    kt2: String,                /*    time pick 2 ident      */
-    kt3: String,                /*    time pick 3 ident      */
-    kt4: String,                /*    time pick 4 ident      */
-    kt5: String,                /*    time pick 5 ident      */
-    kt6: String,                /*    time pick 6 ident      */
-    kt7: String,                /*    time pick 7 ident      */
-    kt8: String,                /*    time pick 8 ident      */
-    kt9: String,                /*    time pick 9 ident      */
-    kf: String,                 /*    end of event ident     */
-    kuser0: String,             /*    available to user      */
-    kuser1: String,             /*    available to user      */
-    kuser2: String,             /*    available to user      */
-    kcmpnm: String,             /*  F component name         */
-    knetwk: String,             /*    network name           */
-    kdatrd: String,             /*    date data read         */
-    kinst: String,              /*    instrument name        */
+    pub kstnm: String,              /*  F station name           */
+    pub kevnm: String,             /*    event name             */
+    pub khole: String,              /*    man-made event name    */
+    pub ko: String,                 /*    event origin time id   */
+    pub ka: String,                 /*    1st arrival time ident */
+    pub kt0: String,                /*    time pick 0 ident      */
+    pub kt1: String,                /*    time pick 1 ident      */
+    pub kt2: String,                /*    time pick 2 ident      */
+    pub kt3: String,                /*    time pick 3 ident      */
+    pub kt4: String,                /*    time pick 4 ident      */
+    pub kt5: String,                /*    time pick 5 ident      */
+    pub kt6: String,                /*    time pick 6 ident      */
+    pub kt7: String,                /*    time pick 7 ident      */
+    pub kt8: String,                /*    time pick 8 ident      */
+    pub kt9: String,                /*    time pick 9 ident      */
+    pub kf: String,                 /*    end of event ident     */
+    pub kuser0: String,             /*    available to user      */
+    pub kuser1: String,             /*    available to user      */
+    pub kuser2: String,             /*    available to user      */
+    pub kcmpnm: String,             /*  F component name         */
+    pub knetwk: String,             /*    network name           */
+    pub kdatrd: String,             /*    date data read         */
+    pub kinst: String,              /*    instrument name        */
 
-    pub swap: bool,
 
+    /// Dependent variable
+    ///   - Amplitude for time series data
+    ///   - Amplitude for Amplitude Phase data
+    ///   - Real for Real Imaginary data
+    ///   - Z for XYZ data
+    ///   - Y for XY data
     pub y: Vec<f32>,
-    file: String,
+    /// Indepenent variable, Time for time series data
+    ///   - Timing for time series data, only for uneven data
+    ///   - Phase for Amplitude Phase data
+    ///   - Imaginary for Real Imaginary data
+    ///   - X for XY data
+    pub x: Vec<f32>,
+    /// Filename of the Sac Data File
+    pub file: String,
+    /// If data is swapped from native byte order
+    pub swap: bool,
 }
 
 
