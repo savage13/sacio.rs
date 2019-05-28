@@ -1,44 +1,61 @@
 
-//! Library for reading and writing SAC files
-//!
-//! SAC - Seismic Analysis Code
-//!
-//! Reference: http://ds.iris.edu/files/sac-manual/
-//!
+/*! Library for reading and writing Seismic Analysis Code (SAC) files
 
-extern crate fft;
-extern crate num_complex;
-extern crate num_traits;
-#[macro_use] extern crate failure;
-#[macro_use] extern crate failure_derive;
-extern crate byteorder;
+Reference: [SAC Manual](http://ds.iris.edu/files/sac-manual/)
 
-extern crate filter;
+```
+use sacio::Sac;
+# use sacio::SacError;
+use sacio::SacString;
 
+let mut s = Sac::from_file("tests/file.sac")?;
+
+assert_eq!(s.mean_amp(), -0.09854721);
+assert_eq!(s.min_amp(), -1.56928);
+assert_eq!(s.max_amp(), 1.52064);
+
+s.y.iter_mut().for_each(|v| *v *= 2.0);
+
+s.extrema_amp();
+
+assert_eq!(s.mean_amp(), -0.09854721 * 2.0);
+assert_eq!(s.min_amp(), -1.56928 * 2.0);
+assert_eq!(s.max_amp(), 1.52064 * 2.0);
+
+s.set_string(SacString::Network, "CI");
+s.set_string(SacString::Station, "PAS");
+s.set_string(SacString::Location, "10");
+s.set_string(SacString::T1, "PKIKP");
+s.set_string(SacString::T1, "SKJKS");
+
+assert_eq!(s.dist_deg(), 3.3574646);
+
+s.to_file("tests/main.sac")?;
+
+# std::fs::remove_file("tests/main.sac")?;
+# Ok::<(), SacError>(())
+```
+*/
 use std::fs::File;
 use std::io::BufReader;
 use std::io::BufWriter;
 use std::path::Path;
 use std::io::prelude::*;
-
-use failure::Error;
+use geographiclib::Geodesic;
+use chrono::Duration;
+use chrono::NaiveDateTime;
+use chrono::NaiveDate;
+use chrono::NaiveTime;
+use chrono::Datelike;
+use chrono::Timelike;
 use byteorder::{BigEndian, LittleEndian, WriteBytesExt, ReadBytesExt, NativeEndian};
 
 mod enums;
 use enums::*;
-
-pub mod spec;
-pub use spec::Spectral;
-pub mod functions;
-pub use functions::Functions;
-pub mod time;
-pub use time::Ops;
-pub use time::Math;
-pub use time::Taper;
-pub use time::RMS;
-pub use time::Calculus;
-pub mod xfilter;
-pub use xfilter::Filter;
+pub use enums::SacString;
+pub use enums::SacZeroTime;
+pub use enums::SacFileType;
+pub use enums::SacDataType;
 
 #[cfg(target_endian = "big")]
 type NonNativeEndian = LittleEndian;
@@ -50,179 +67,42 @@ type NonNativeEndian = BigEndian;
 #[cfg(target_endian = "little")]
 type __NativeEndian = LittleEndian;
 
-
-macro_rules! sac_reals {
-    ($s:ident, $function:ident) => { sac_reals!($s, ignore_idnet, ignore_type, $function); };
-    ($s:ident, $z:ident, $function:ident) => { sac_reals!($s, $z, ignore_type, $function); };
-    ($s:ident, $z:ident, $t:ty, $function:ident) => {
-        $function!($s,$z,$t,
-                   delta, depmin, depmax, scale, odelta, b, e, o, a, fmt,
-                   t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, f,
-                   resp0, resp1, resp2, resp3, resp4,
-                   resp5, resp6, resp7, resp8, resp9,
-                   stla, stlo, stel, stdp, evla, evlo, evel, evdp, mag,
-                   user0, user1, user2, user3, user4,
-                   user5, user6, user7, user8, user9,
-                   dist, az, baz, gcarc, sb, sdelta,
-                   depmen, cmpaz, cmpinc,
-                   xminimum, xmaximum, yminimum, ymaximum,
-                   unused6, unused7, unused8, unused9, unused10,
-                   unused11, unused12
-        );
-    }
-}
-
-
-macro_rules! sac_ints {
-    ($s:ident, $function:ident) => { sac_ints!($s, ignore_idnet, ignore_type, $function); };
-    ($s:ident, $z:ident, $function:ident) => { sac_ints!($s, $z, ignore_type, $function); };
-    ($s:ident, $z:ident, $t:ty, $function:ident) => {
-        $function!($s,$z,$t,
-                   nzyear, nzjday, nzhour, nzmin, nzsec, nzmsec, nvhdr,
-                   norid, nevid, npts, nsnpts, nwfid,
-                   nxsize, nysize, unused15, iftype, idep, iztype,
-                   unused16, iinst, istreg, ievreg, ievtyp,
-                   iqual, isynth, imagtyp, imagsrc,
-                   unused19, unused20, unused21, unused22,
-                   unused23, unused24, unused25, unused26,
-                   leven, lpspol, lovrok, lcalda, unused27);
-
-    };
-}
-
-macro_rules! sac_strings {
-    ($s:ident, $function:ident) => { sac_strings!($s, ignore_ident, $function); };
-    ($s:ident, $x:ident, $function:ident) => {
-        $function!($s,$x,
-                   kstnm, kevnm, khole, ko, ka,
-                   kt0, kt1, kt2, kt3, kt4, kt5, kt6, kt7, kt8, kt9,
-                   kf, kuser0, kuser1, kuser2, kcmpnm, knetwk, kdatrd, kinst);
-    }
-}
-
-macro_rules! sac_u8_strings {
-    ($s:ident, $function:ident) => { sac_u8_strings!($s, ignore_ident, $function); };
-    ($s:ident, $z:ident, $function:ident) => {
-        $function!($s,$z,
-                   u8_kstnm, u8_kevnm, u8_khole, u8_ko, u8_ka,
-                   u8_kt0, u8_kt1, u8_kt2, u8_kt3, u8_kt4,
-                   u8_kt5, u8_kt6, u8_kt7, u8_kt8, u8_kt9,
-                   u8_kf, u8_kuser0, u8_kuser1, u8_kuser2, u8_kcmpnm,
-                   u8_knetwk, u8_kdatrd, u8_kinst);
-    }
-}
-
-
-macro_rules! string_to_u8 {
-    ($s:ident, $($a:ident, $b:ident),*) => {
-        $(
-            let mut tmp = if $s.$b.len() == 8 {
-                format!("{:8}", $s.$a)
-            } else {
-                format!("{:16}", $s.$a)
-            };
-            tmp.truncate($s.$b.len());
-            if tmp.trim_right().len() == 0 {
-                tmp = format!("{:8}", "-12345");
-            }
-            $s.$b.copy_from_slice( tmp.as_bytes() );
-        )*
-    }
-}
-
-macro_rules! sac_strings_pair {
-    ($s:ident, $function:ident) => {
-        $function!($s,
-                   kstnm, u8_kstnm, kevnm, u8_kevnm, khole, u8_khole,
-                   ko, u8_ko, ka, u8_ka,
-                   kt0, u8_kt0, kt1, u8_kt1, kt2, u8_kt2, kt3, u8_kt3, kt4, u8_kt4,
-                   kt5, u8_kt5, kt6, u8_kt6, kt7, u8_kt7, kt8, u8_kt8, kt9, u8_kt9,
-                   kf, u8_kf,
-                   kuser0, u8_kuser0, kuser1, u8_kuser1, kuser2, u8_kuser2,
-                   kcmpnm, u8_kcmpnm, knetwk,  u8_knetwk, kdatrd, u8_kdatrd,
-                   kinst, u8_kinst
-        );
-    }
-}
-
-macro_rules! copy_values {
-    ($s:ident, $from:ident, $t:ty, $($x:ident),*) => ( $($s.$x = $from.$x;  )* );
-}
-macro_rules! clone_values {
-    ($s:ident, $from:ident, $($x:ident),*) => ( $($s.$x = $from.$x.clone();  )* );
-}
-macro_rules! write_real {
-    ($s:ident, $fp:ident, $t:ty, $x:ident) => ( $fp.write_f32::<$t>($s.$x)?; );
-}
-macro_rules! write_reals {
-    ($s:ident, $fp:ident, $t:ty, $($x:ident),+) => ( $( write_real!($s,$fp,$t,$x); )+ );
-}
-macro_rules! write_int {
-    ($s:ident, $fp:ident, $t:ty, $x:ident) => ( $fp.write_i32::<$t>($s.$x)?; );
-}
-macro_rules! write_ints {
-    ($s:ident, $fp:ident, $t:ty, $($x:ident),+) => ( $( write_int!($s,$fp,$t,$x); )+ );
-}
-macro_rules! read_real {
-    ($s:ident, $fp:ident, $t:ty, $x:ident) => ( $s.$x = $fp.read_f32::<$t>()?; );
-}
-macro_rules! read_reals {
-    ($s:ident, $fp:ident, $t:ty, $($x:ident),+) => ( $( read_real!($s,$fp,$t,$x); )+ );
-}
-macro_rules! read_int {
-    ($s:ident, $fp:ident, $t:ty, $x:ident) => ( $s.$x = $fp.read_i32::<$t>()?; );
-}
-macro_rules! read_ints {
-    ($s:ident, $fp:ident, $t:ty, $($x:ident),+) => ( $( read_int!($s,$fp,$t,$x); )+ );
-}
-macro_rules! read_strings {
-    ($s:ident, $fp:ident, $($x:ident),+) => ( $( $fp.read_exact(&mut $s.$x)?; )+ );
-}
-macro_rules! write_strings {
-    ($s:ident, $fp:ident, $($x:ident),+) => ( $( $fp.write_all(&$s.$x)?; )+ );
-}
-
-macro_rules! u8_to_string {
-    ($s:ident, $($x:ident, $u8x:ident),*) => (
-        $( $s.$x = String::from_utf8($s.$u8x.to_vec()).unwrap(); )*
-    );
-}
-
+//const HEADER_SIZE : usize = 632;
 const SAC_INT_UNDEF : i32 = -12345;
 const SAC_FLOAT_UNDEF : f32 = -12345.0;
+const _SAC_STRING_UNDEF : &'static str = "-12345  ";
 
-macro_rules! f32_undef {
-    ($s:ident, $q:ident, $t:ty, $($x:ident),*) => ( $( $s.$x = SAC_FLOAT_UNDEF; )* );
-}
-macro_rules! i32_undef {
-    ($s:ident, $q:ident, $t:ty, $($x:ident),*) => ( $( $s.$x = SAC_INT_UNDEF; )* );
-}
-macro_rules! str_undef {
-    ($s:ident, $q:ident, $($x:ident),*) => ( $( $s.$x = String::from("-12345  "); )* );
-}
-macro_rules! u8s_undef {
-    ($s:ident, $q:ident, $($x:ident),*) => ( $(
-        for i in 0 .. $s.$x.len() {
-            $s.$x[i] = 32;
-        }
-        $s.$x[0] = 45;
-        $s.$x[1] = 49;
-        $s.$x[2] = 50;
-        $s.$x[3] = 51;
-        $s.$x[4] = 52;
-        $s.$x[5] = 53;
-    )* );
+#[inline]
+fn fis(x: f32) -> bool {
+    x != SAC_FLOAT_UNDEF
 }
 
+#[macro_use] mod macros;
+mod eq;
+
+pub mod doc;
+
+/// Value containing an absolute or relative time
+pub enum TimeValue {
+    /// Relative time in seconds
+    Relative(Duration),
+    /// Absolute time year-month-day, HH:MM:SS
+    Absolute(NaiveDateTime),
+}
+
+
+/// Convert [u8] to Strings
 fn sac_u8_to_strings(s: &mut Sac) {
     sac_strings_pair!(s, u8_to_string);
 }
 
+/// Convert Strings into [u8]
 fn sac_strings_to_u8(s: &mut Sac) {
     sac_strings_pair!(s, string_to_u8);
 }
 
-fn sac_data_read_comp<T: Read>(file: &mut T, swap: bool, npts: usize) -> Result<Vec<f32>,Error>{
+/// Read a single data component
+fn sac_data_read_comp<T: Read>(file: &mut T, swap: bool, npts: usize) -> Result<Vec<f32>,SacError>{
     let mut y = vec![0.0; npts];
     if swap {
         file.read_f32_into::<NonNativeEndian>(&mut y)?;
@@ -231,7 +111,8 @@ fn sac_data_read_comp<T: Read>(file: &mut T, swap: bool, npts: usize) -> Result<
     }
     Ok(y)
 }
-fn sac_data_read<T: Read>(file: &mut T, h: &mut Sac) -> Result<(),Error>{
+/// Read sac data from a file
+fn sac_data_read<T: Read>(file: &mut T, h: &mut Sac) -> Result<(),SacError>{
     let npts = h.npts as usize;
     h.y = sac_data_read_comp(file, h.swap, npts)?;
     if h.ncomps() == 2 {
@@ -240,7 +121,8 @@ fn sac_data_read<T: Read>(file: &mut T, h: &mut Sac) -> Result<(),Error>{
     Ok(())
 }
 
-fn sac_data_write<F: Write>(file: &mut F, s: &mut Sac, npts: usize) -> Result<(),Error> {
+/// Write a sac data to a file
+fn sac_data_write<F: Write>(file: &mut F, s: &mut Sac, npts: usize) -> Result<(),SacError> {
     if npts != s.y.len() {
         panic!("Inconsistent Data: npts [{}] != data len [{}]", npts, s.y.len());
     }
@@ -254,20 +136,17 @@ fn sac_data_write<F: Write>(file: &mut F, s: &mut Sac, npts: usize) -> Result<()
     Ok(())
 }
 
-macro_rules! ri32 {
-    ($file: expr, $t: tt) => ( $file.read_i32::<$t>()? )
-}
-
-fn sac_header_is_swapped<T: Read + Seek>(file: &mut T) -> Result<bool,Error> {
+/// Determine if the sac file is byte swapped
+fn sac_header_is_swapped<T: Read + Seek>(file: &mut T) -> Result<bool,SacError> {
     use std::io::SeekFrom;
     file.seek(SeekFrom::Start(70*4 + 6*4))?;
-    let n = ri32!(file, NativeEndian);
+    let n = file.read_i32::<NativeEndian>()?;
 
     let swap = if n > 5 && n <= 8 {
         false
     } else {
         file.seek(SeekFrom::Start(70*4 + 6*4))?;
-        let n = ri32!(file, NonNativeEndian);
+        let n = file.read_i32::<NonNativeEndian>()?;
         if n < 0 || n > 10 {
             panic!("Unknown file type: {}", n);
         }
@@ -277,10 +156,9 @@ fn sac_header_is_swapped<T: Read + Seek>(file: &mut T) -> Result<bool,Error> {
 
     Ok(swap)
 }
-//const HEADER_SIZE : usize = 632;
 
-
-fn sac_header_read<T: Read + Seek>(file: &mut T, h: &mut Sac) -> Result<(),Error>{
+/// Read a sac file header
+fn sac_header_read<T: Read + Seek>(file: &mut T, h: &mut Sac) -> Result<(),SacError>{
     use std::io::SeekFrom;
 
     h.swap = sac_header_is_swapped(file)?;
@@ -297,7 +175,9 @@ fn sac_header_read<T: Read + Seek>(file: &mut T, h: &mut Sac) -> Result<(),Error
     Ok(())
 }
 
-fn sac_header_write<F: Write>(file: &mut F, s: &mut Sac) -> Result<(),Error>{
+
+/// Write a sac file header
+fn sac_header_write<F: Write>(file: &mut F, s: &mut Sac) -> Result<(),SacError>{
 
     if s.swap {
         sac_reals!(s, file, NonNativeEndian, write_reals );
@@ -310,66 +190,6 @@ fn sac_header_write<F: Write>(file: &mut F, s: &mut Sac) -> Result<(),Error>{
     Ok(())
 }
 
-macro_rules! xeq {
-    ($a:ident,$b:ident,$t:ty,$($x:ident),*) => {
-        $( if $a.$x != $b.$x {
-            println!("field {}:  {} != {}", stringify!($x),$a.$x, $b.$x);
-            return false;
-        } )*
-    };
-}
-macro_rules! xeqf {
-    ($a:ident,$b:ident,$t:ty,$($x:ident),*) => {
-        $( if ($a.$x - $b.$x).abs() > 1e-5 {
-            let dx = ($a.$x - $b.$x).abs();
-            println!("field {}: {} != {} [{}]", stringify!($x),$a.$x, $b.$x, dx);
-            return false;
-        } )*
-    };
-}
-
-fn veq(a: &[f32], b: &[f32], tol: f32) -> bool {
-    if a.len() != b.len() {
-        println!("Data Lenghts unequal: {} vs {}", a.len(), b.len());
-        return false;
-    }
-    if a != b {
-        for i in 0 .. a.len() {
-            println!("{:6} {:21.15e} {:21.15e} {:21.15e}", i, a[i], b[i], (a[i]-b[i]).abs());
-            if (a[i] - b[i]).abs() > tol {
-                println!("{}: {} {} tol: {}", i, a[i], b[i], tol);
-                return false;
-            }
-        }
-        return true;
-    }
-    true
-}
-
-impl PartialEq for Sac {
-    fn eq(&self, other: &Sac) -> bool {
-        //println!("eq ints");
-        sac_ints!(self,    other, xeq);
-        //println!("eq strings");
-        sac_strings!(self, other, xeq);
-        //println!("eq reals");
-        sac_reals!(self,   other, xeqf);
-        //println!("eq npts");
-        if self.npts != other.npts {
-            println!("npts not equal {} {}",self.npts, other.npts);
-            return false;
-        }
-        //println!("y len");
-        if self.y.len() != other.y.len() {
-            println!("npts not equal in vec, :/ {} {}", self.y.len(), other.y.len());
-            return false;
-        }
-        //println!("y compare {}", self.y.len());
-        veq(&self.y, &other.y, 1e-5) &&
-            veq(&self.x, &other.x, 1e-5)
-    }
-}
-
 use std::fmt;
 impl fmt::Debug for Sac {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -378,87 +198,189 @@ impl fmt::Debug for Sac {
 }
 
 
-#[derive(Fail, Debug)]
-#[fail(display = "Operation attempted on a non-spectral data type.")]
-pub struct NotSpectral;
-#[derive(Fail, Debug)]
-#[fail(display = "Operation attempted on a non-temporal data type.")]
-pub struct NotTime;
-#[derive(Fail, Debug)]
-#[fail(display = "Encountered NaN Value.")]
-pub struct NaN;
 
+
+/// Errors associated with Reading and Writing Sac Files
+#[derive(Debug)]
+pub enum SacError {
+    NotSpectral,
+    NotTime,
+    NaN,
+    BadLatitude,
+    BadLongitude,
+    BadAzimuth,
+    BadInclination,
+    Io(std::io::Error),
+    BadKey,
+}
+
+/// Wrap an std::io::Error
+impl From<std::io::Error> for SacError {
+    fn from(err: std::io::Error) -> Self {
+        SacError::Io(err)
+    }
+}
+
+fn duration_to_f64(dt: Duration) -> f64 {
+    dt.num_seconds() as f64 + (dt.num_milliseconds() as f64 / 1_000.0)
+}
+
+fn time_from_parts(year: i32, doy: i32,
+                   hour: i32, min: i32, sec: i32, msec: i32) -> NaiveDateTime {
+    NaiveDateTime::new(NaiveDate::from_yo(year, doy as u32),
+                       NaiveTime::from_hms_milli(hour as u32,
+                                                 min as u32,
+                                                 sec as u32,
+                                                 msec as u32))
+}
+
+/// Sac Implementation
 impl Sac {
-    pub fn is_time(&self) -> Result<(), Error> {
-        match self.iftype.into() {
-            SacFileType::Time |
-            SacFileType::XY |
-            SacFileType::XYZ  => Ok(()),
-            SacFileType::AmpPhase |
-            SacFileType::RealImag => Err(NotTime.into()),
-        }
-    }
-    pub fn is_spectral(&self) -> Result<(),Error> {
-        match self.iftype.into() {
-            SacFileType::Time |
-            SacFileType::XY |
-            SacFileType::XYZ  => Err(NotSpectral.into()),
-            SacFileType::AmpPhase |
-            SacFileType::RealImag => Ok(()),
-        }
-    }
-    pub fn is_realimag(&self) -> bool {
-        self.iftype == SacFileType::RealImag.into()
-    }
-    pub fn is_ampphase(&self) -> bool {
-        self.iftype == SacFileType::AmpPhase.into()
-    }
-
-    /// Determine the number of data components
-    pub fn ncomps(&self) -> usize {
-        match self.iftype.into() {
-            SacFileType::Time |
-            SacFileType::XY => {
-                if self.is_even() { 1 } else { 2 }
-            },
-            SacFileType::XYZ => 1,
-            SacFileType::RealImag |
-            SacFileType::AmpPhase => 2,
-        }
-    }
-
-    /// Set Refernce Time
-    pub fn set_time(&mut self,
-                    year: i32, oday: i32, hour: i32,
-                    min: i32, sec: i32, msec: i32) {
-        self.nzyear = year;
-        self.nzjday = oday;
-        self.nzhour = hour;
-        self.nzmin  = min;
-        self.nzsec  = sec;
-        self.nzmsec = msec;
-    }
-    /// Read a SAC file
-    pub fn read<T: AsRef<Path>>(path: T) -> Result<Sac,Error> {
+    /// Read a sac file
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// let s = Sac::from_file("tests/file.sac")?;
+    /// assert_eq!(s.delta(), 0.01);
+    /// # Ok::<(), SacError>(())
+    /// ```
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Sac,SacError> {
         let file = File::open(path)?;
         let mut file = BufReader::new(file);
+        Sac::read(&mut file)
+    }
+    /// Read a sac file from a buffer
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// // This simulates having the data already in memory
+    /// let mut buf = std::fs::read("tests/file.sac")?;
+    /// let mut rdr = std::io::Cursor::new(&mut buf);
+    ///
+    /// let s = Sac::read(&mut rdr)?;
+    /// assert_eq!(s.delta(), 0.01);
+    /// # Ok::<(), SacError>(())
+    /// ```
+    pub fn read<R: Read + Seek>(buf: &mut R) -> Result<Sac,SacError> {
         let mut s = Sac::new();
-        sac_header_read(&mut file, &mut s)?;
+        sac_header_read(buf, &mut s)?;
         sac_u8_to_strings(&mut s);
-        sac_data_read(&mut file, &mut s)?;
+        sac_data_read(buf, &mut s)?;
         Ok(s)
     }
-    /// Write a SAC file
-    pub fn write<T: AsRef<Path>>(&mut self, path: T) -> Result<(),Error>{
+    /// Write a sac file
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// let mut s = Sac::from_file("tests/file.sac")?;
+    /// 
+    /// s.to_file("tests/to_file.sac")?;
+    ///
+    /// let s2 = Sac::from_file("tests/to_file.sac")?;
+    /// assert_eq!(s.delta(), s2.delta());
+    /// assert_eq!(s.npts(), s2.npts());
+    ///
+    /// # std::fs::remove_file("tests/to_file.sac")?;
+    /// # Ok::<(), SacError>(())
+    /// ```
+    pub fn to_file<P: AsRef<Path>>(&mut self, path: P) -> Result<(),SacError> {
         let file = File::create(path)?;
         let mut file = BufWriter::new(file);
+        self.write(&mut file)
+    }
+    /// Write a sac file to a buffer
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// let mut s = Sac::from_file("tests/file.sac")?;
+    /// let mut buf = vec![];
+    /// s.write(&mut buf)?;
+    ///
+    /// let mut rdr = std::io::Cursor::new(&mut buf);
+    /// let s2 = Sac::read(&mut rdr)?;
+    /// assert_eq!(s.delta(), s2.delta());
+    /// assert_eq!(s.npts(), s2.npts());
+    /// # Ok::<(), SacError>(())
+    /// ```
+    /// Write a SAC file
+    pub fn write<W: Write>(&mut self, buf: &mut W) -> Result<(),SacError> {
         let npts = self.npts as usize;
         sac_strings_to_u8(self);
-        sac_header_write(&mut file, self)?;
-        sac_data_write(&mut file, self, npts)?;
+        sac_header_write(buf, self)?;
+        sac_data_write(buf, self, npts)?;
         Ok(())
     }
+    /// Determine if file is to be swapped on output
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// let mut s = Sac::from_file("tests/file.sac")?;
+    /// assert_eq!(s.swapped(), false);
+    ///
+    /// let mut s = Sac::from_file("tests/file.sac.swap")?;
+    /// assert_eq!(s.swapped(), true);
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
+    pub fn swapped(&self) -> bool {
+        self.swap
+    }
+
+    /// Determine if file is to be swapped on output
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// let mut s = Sac::from_file("tests/file.sac")?;
+    /// assert_eq!(s.swapped(), false);
+    ///
+    /// s.set_swap(true);
+    /// s.to_file("tests/set_swap.sac")?;
+    ///
+    /// let mut s = Sac::from_file("tests/set_swap.sac")?;
+    /// assert_eq!(s.swapped(), true);
+    ///
+    /// # std::fs::remove_file("tests/set_swap.sac")?;
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
+    pub fn set_swap(&mut self, swap: bool) {
+        self.swap = swap;
+    }
     /// Create an empty SAC file
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// use sacio::SacString;
+    /// use sacio::SacZeroTime;
+    /// use sacio::SacFileType;
+    /// use sacio::SacDataType;
+    ///
+    /// let s = Sac::new();
+    /// assert_eq!(s.delta(), -12345.0);
+    /// assert_eq!(s.string(SacString::EventName), "-12345  ");
+    /// assert_eq!(s.zero_time(), SacZeroTime::None);
+    /// assert_eq!(s.file_type(), SacFileType::Time);
+    /// assert_eq!(s.data_type(), SacDataType::None);
+    ///
+    /// assert_eq!(s.version(), 6);
+    /// assert_eq!(s.station_polarity(), false);
+    /// assert_eq!(s.mutability(), true);
+    /// assert_eq!(s.calc_dist_az(), true);
+    ///
+    /// assert_eq!(s.npts(), 0);
+    /// ```
     pub fn new() -> Sac {
         let mut s0 : Sac = Sac { .. Default::default() };
         sac_reals!(s0, f32_undef);
@@ -474,38 +396,305 @@ impl Sac {
         s0.lovrok   = 1;
         s0.lcalda   = 1;
         s0.unused27 = 0;
+        s0.npts     = 0;
         s0.y = vec![];
         s0.x = vec![];
         s0
     }
+    /// Check if file is spectral
+    ///
+    ///```
+    /// use sacio::Sac;
+    /// let s = Sac::from_amp(vec![0.,1.,2.], 0.0, 1.0);
+    /// assert!( ! s.is_spectral() );
+    /// ```
+    pub fn is_spectral(&self) -> bool {
+        match self.iftype.into() {
+            SacFileType::Time |
+            SacFileType::XY |
+            SacFileType::XYZ  => false,
+            SacFileType::AmpPhase |
+            SacFileType::RealImag => true,
+        }
+    }
+    /// Check is file is a Real/Imaginary Pair
+    ///
+    ///     use sacio::Sac;
+    ///     let s = Sac::from_amp(vec![0.,1.,2.],0.0, 1.0);
+    ///     assert!( ! s.is_real_imag() );
+    ///
+    pub fn is_real_imag(&self) -> bool {
+        self.iftype == SacFileType::RealImag.into()
+    }
+    /// Check if file is a Amplitude/Phase Pair
+    ///
+    ///     use sacio::Sac;
+    ///     let s = Sac::from_amp(vec![0.,1.,2.],0.0, 1.0);
+    ///     assert!( ! s.is_amp_phase() );
+    ///
+    pub fn is_amp_phase(&self) -> bool {
+        self.iftype == SacFileType::AmpPhase.into()
+    }
+    /// Check if file is a time series file
+    ///
+    ///     use sacio::Sac;
+    ///     let s = Sac::from_amp(vec![0.,1.,2.],0.0, 1.0);
+    ///     assert!( s.is_time() );
+    ///
+    pub fn is_time(&self) -> bool {
+        self.iftype == SacFileType::Time.into()
+    }
+    /// Get File type (iftype)
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    /// use sacio::SacFileType;
+    ///
+    /// let s = Sac::from_file("tests/file.sac")?;
+    /// assert_eq!(s.file_type(), SacFileType::Time);
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
+    pub fn file_type(&self) -> SacFileType {
+        self.iftype.into()
+    }
+    /// Set File type (iftype)
+    pub fn set_file_type(&mut self, file_type: SacFileType) {
+        self.iftype = file_type.into();
+    }
+
+    /// Determine the number of data components
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// let s = Sac::from_file("tests/file.sac")?;
+    /// assert_eq!(s.ncomps(), 1);
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
+    pub fn ncomps(&self) -> usize {
+        match self.iftype.into() {
+            SacFileType::Time |
+            SacFileType::XY => {
+                if self.evenly_spaced() { 1 } else { 2 }
+            },
+            SacFileType::XYZ => 1,
+            SacFileType::RealImag |
+            SacFileType::AmpPhase => 2,
+        }
+    }
+    /// Get number of data points
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// let s = Sac::from_file("tests/file.sac")?;
+    /// assert_eq!(s.npts(), 1000);
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
+    pub fn npts(&self) -> i32 {
+        self.npts
+    }
+    /// Get Header Version
+    ///
+    /// Should be 6
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// let s = Sac::from_file("tests/file.sac")?;
+    /// assert_eq!(s.version(), 6);
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
+    pub fn version(&self) -> i32 {
+        self.nvhdr
+    }
+    /// Get Reference Time
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    /// use chrono::{NaiveDateTime, NaiveDate, NaiveTime};
+    ///
+    /// let s = Sac::from_file("tests/file.sac")?;
+    /// let date = NaiveDate::from_yo(1981, 88);
+    /// let time = NaiveTime::from_hms_milli(10, 38, 14, 0);
+    /// assert_eq!(s.time(), NaiveDateTime::new(date, time));
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
+    pub fn time(&self) -> NaiveDateTime {
+        time_from_parts(self.nzyear, self.nzjday,
+                        self.nzhour, self.nzmin, self.nzsec,
+                        self.nzmsec)
+    }
+    /// Set Refernce Time
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    /// use chrono::{NaiveDateTime, NaiveDate, NaiveTime};
+    ///
+    /// let mut s = Sac::from_file("tests/file.sac")?;
+    /// let date = NaiveDate::from_yo(1984, 29);
+    /// let time = NaiveTime::from_hms_milli(15, 12, 59, 456);
+    /// let when = NaiveDateTime::new(date, time);
+    /// s.set_time(when);
+    ///
+    /// assert_eq!(s.time(), when);
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
+    pub fn set_time(&mut self, time: NaiveDateTime) {
+        self.nzyear = time.year();
+        self.nzjday = time.ordinal() as i32;
+        self.nzhour = time.hour() as i32;
+        self.nzmin  = time.minute() as i32;
+        self.nzsec  = time.second() as i32;
+        self.nzmsec = time.nanosecond() as i32 / 1_000_000;
+    }
     /// Compute the maximum amplitude
-    pub fn max_amp(&self) -> f32 {
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// let s = Sac::from_file("tests/file.sac")?;
+    /// assert_eq!(s.calc_max_amp(), s.max_amp());
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
+    pub fn calc_max_amp(&self) -> f32 {
         let mut vmax = self.y[0];
         for v in self.y.iter() { if *v > vmax { vmax = *v; } }
         vmax
     }
     /// Compute the minimum amplitude
-    pub fn min_amp(&self) -> f32 {
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// let s = Sac::from_file("tests/file.sac")?;
+    /// assert_eq!(s.calc_min_amp(), s.min_amp());
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
+    pub fn calc_min_amp(&self) -> f32 {
         let mut vmin = self.y[0];
         for v in self.y.iter() { if *v < vmin { vmin = *v; } }
         vmin
     }
     /// Compute the mean amplitude
-    pub fn mean_amp(&self) -> f32 {
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// let s = Sac::from_file("tests/file.sac")?;
+    /// assert_eq!(s.calc_mean_amp(), s.mean_amp());
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
+    pub fn calc_mean_amp(&self) -> f32 {
         let vmean : f64 = self.y.iter().map(|x| *x as f64).sum();
         (vmean / self.npts as f64) as f32
     }
-    /// Compute and set min, man and mean amplitudes
+    /// Compute and set min, man and mean amplitudes of the y component
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// let mut s = Sac::from_file("tests/file.sac")?;
+    ///
+    /// assert_eq!(s.mean_amp(), -0.09854721);
+    /// assert_eq!(s.min_amp(), -1.56928);
+    /// assert_eq!(s.max_amp(), 1.52064);
+    ///
+    /// s.y.iter_mut().for_each(|v| *v *= 2.0);
+    ///
+    /// s.extrema_amp();
+    ///
+    /// assert_eq!(s.mean_amp(), -0.09854721 * 2.0);
+    /// assert_eq!(s.min_amp(), -1.56928 * 2.0);
+    /// assert_eq!(s.max_amp(), 1.52064 * 2.0);
+    ///
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
     pub fn extrema_amp(&mut self) {
-        self.depmax = self.max_amp();
-        self.depmin = self.min_amp();
-        self.depmen = self.mean_amp();
+        self.depmax = self.calc_max_amp();
+        self.depmin = self.calc_min_amp();
+        self.depmen = self.calc_mean_amp();
     }
-    /// Compute and set extremas in time and amplitude
+
+    /// Compute and set extremas in x and y
+    ///
+    ///  File Type      | y-min   | y-max    | y-mean   | x-min      | x-max
+    /// ----------------|---------|----------|----------|------------|-------------
+    ///  time / even    | min(amp)| min(amp) | mean(amp)| b          | e = b + (n-1)*dt
+    ///  time / uneven  | min(amp)| min(amp) | mean(amp)| b = min(x) | e = max(x)
+    ///  general xy     | min(amp)| min(amp) | mean(amp)| b          | e = b + (n-1)*dt
+    ///  amp / phase    | -       | -        | -        | b = 0      | e = f_nyquist
+    ///  real/ imag     | -       | -        | -        | b = 0      | e = f_nyquist
+    ///  general xyz    | -       | -        | -        | -          | -
+    ///
+    ///
     pub fn extrema(&mut self) {
         self.extrema_amp();
-        self.e = self.b + self.delta * ((self.npts-1) as f32);
+        self.calc_be();
     }
+    fn calc_be(&mut self) {
+        if self.evenly_spaced() {
+            match self.iftype.into() {
+                SacFileType::Time |
+                SacFileType::XY =>
+                    self.e = self.b + self.delta * ((self.npts-1) as f32),
+                SacFileType::RealImag |
+                SacFileType::AmpPhase => {
+                    let nfreq = if self.npts % 2 == 0 {
+                        self.npts / 2
+                    } else {
+                        (self.npts - 1) / 2
+                    };
+                    self.e = self.b + self.delta * nfreq as f32;
+                },
+                SacFileType::XYZ => {},
+            }
+        } else if self.x.len() > 0 {
+            let mut xmin = self.x[0];
+            let mut xmax = self.x[0];
+            for xi in self.x.iter() { if *xi < xmin { xmin = *xi; } }
+            for xi in self.x.iter() { if *xi > xmax { xmax = *xi; } }
+            self.b = xmin;
+            self.e = xmax;
+        }
+    }
+    /// Create a SAC File with new data, copying header values
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// let s = Sac::from_file("tests/file.sac")?;
+    ///
+    /// let t = s.with_new_data(vec![0., 1., 0.0]);
+    ///
+    /// assert_eq!(t.min_amp(), 0.0);
+    /// assert_eq!(t.max_amp(), 1.0);
+    /// assert_eq!(t.npts(), 3);
+    ///
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
     pub fn with_new_data(&self, y: Vec<f32>) -> Self {
         let mut s = self.clone();
         s.y = y;
@@ -513,13 +702,13 @@ impl Sac {
         s.extrema();
         s
     }
-    /// Create new sac file from data and name
-    pub fn from_amp_with_name(y: Vec<f32>, b: f64, dt: f64, file: &str) -> Sac {
-        let mut s = Sac::from_amp(y, b, dt);
-        s.file = String::from(file);
-        return s;
-    }
-    /// Create new sac from data
+    /// Create new sac from data from amplitude, begin value, `b`, and sample rate, `dt`
+    ///
+    ///     use sacio::Sac;
+    ///     let s = Sac::from_amp(vec![0., 1., 2.], 0.0, 0.1);
+    ///     assert!( s.is_time() );
+    ///     assert!( s.y == &[0., 1., 2.] );
+    ///
     pub fn from_amp(y: Vec<f32>, b: f64, dt: f64) -> Sac {
         let mut s = Sac::new();
         s.npts   = y.len() as i32;
@@ -529,165 +718,382 @@ impl Sac {
         s.iftype = SacFileType::Time.into();
         s.leven  = true as i32;
         s.extrema();
-        return s;
-    }
-    pub fn copy_header(&mut self, from: &Sac) {
-        sac_reals!(self, from, copy_values );
-        sac_ints!(self, from, copy_values );
-        sac_strings!(self, from, clone_values );
+        s
     }
 
     /// Determine if all data is finite, not NaN, inf
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    ///
+    /// let s = Sac::from_amp(vec![0.,1.], 0.0, 1.0);
+    /// assert_eq!(s.is_finite(), true);
+    ///
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
     pub fn is_finite(&self) -> bool {
         self.y.iter().all(|x| x.is_finite() == true)
     }
-
+    /// Get Zero Time Equivalent
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    /// use sacio::SacZeroTime;
+    ///
+    /// let s = Sac::from_file("tests/file.sac")?;
+    /// assert_eq!(s.zero_time(), SacZeroTime::B);
+    ///
+    /// # Ok::<(), SacError>(())
+    /// ```
     pub fn zero_time(&self) -> SacZeroTime {
         self.iztype.into()
     }
-    pub fn is_even(&self) -> bool {
-        if self.leven == 0 { false } else { true }
+    /// Get Station_polarity
+    pub fn station_polarity(&self) -> bool {
+        self.lpspol != 0
     }
-    pub fn is_dist_az(&self) -> bool {
-        if self.lcalda == 0 { false } else { true }
+    /// Set Station polarity
+    pub fn set_station_polarity(&mut self, flipped: bool) {
+        self.lpspol = flipped as i32;
     }
-    pub fn calc_dist_az(&mut self, value: bool) {
+    /// Determine is file is evenly spaced
+    pub fn evenly_spaced(&self) -> bool {
+        self.leven != 0
+    }
+    /// Determine is file should calculate the distance and azimuth (lcalda)
+    pub fn calc_dist_az(&self) -> bool {
+        self.lcalda != 0
+    }
+    /// Set if file should calculate the distance and azimuth (lcalda)
+    pub fn set_calc_dist_az(&mut self, value: bool) {
         self.lcalda = value as i32;
     }
-    pub fn is_mutable(&self) -> bool {
-        if self.lovrok == 0 { false } else { true }
+    /// Check is file can be overwritten (lovrok)
+    pub fn mutability(&self) -> bool {
+        self.lovrok != 0
     }
-    pub fn mutable(&mut self) {
-        self.lovrok = true as i32;
+    /// Set the file as mutable (lovrok)
+    pub fn set_mutability(&mut self, value: bool) {
+        self.lovrok = value as i32;
     }
-    pub fn immutable(&mut self) {
-        self.lovrok = false as i32;
-    }
+    /// Get Event type (ievtyp)
     pub fn event_type(&self) -> SacEventType {
         self.ievtyp.into()
     }
-    pub fn amp_type(&self) -> SacDataType {
+    /// Set Event ytpe (ievtyp)
+    pub fn set_event_type(&mut self, etype: SacEventType) {
+        self.ievtyp = etype.into();
+    }
+    /// Get Data Quality
+    pub fn data_quality(&self) -> SacQuality {
+        self.iqual.into()
+    }
+    /// Set Data Quality
+    pub fn set_data_quality(&mut self, qual: SacQuality) {
+        self.iqual = qual.into();
+    }
+    /// Get Amplitude Type (idep)
+    pub fn data_type(&self) -> SacDataType {
         self.idep.into()
     }
-    pub fn file_type(&self) -> SacFileType {
-        self.iftype.into()
+
+    /// Set synthetic flag (isynth)
+    pub fn synthetic(&self) -> bool {
+        self.isynth == 1
     }
-    pub fn fval(&self, key: &str) -> Option<f32> {
+    /// Set synthetic flag (isynth)
+    pub fn set_synthetic(&mut self, synth: bool) {
+        self.isynth = if synth { 1 } else { 0 };
+    }
+    /// Set Zero Time Type
+    pub fn set_zero_time_type(&mut self, ztype: SacZeroTime) {
+        self.iztype = ztype.into();
+    }
+    /// Get Magnitude Type
+    pub fn magnitude_type(&self) -> SacMagnitudeType {
+        self.imagtyp.into()
+    }
+    /// Set Magnitude Type
+    pub fn set_magnitude_type(&mut self, mag: SacMagnitudeType) {
+        self.imagtyp = mag.into();
+    }
+    /// Get Magnitude Source
+    pub fn magnitude_source(&self) -> SacMagnitudeSource {
+        self.imagsrc.into()
+    }
+    /// Set Magnitude Source
+    pub fn set_magnitude_source(&mut self, magsrc: SacMagnitudeSource) {
+        self.imagsrc = magsrc.into();
+    }
+    /// Get Instrument Type
+    ///
+    /// This type is historical, you probably want SacStrings::Instrument
+    ///
+    pub fn instrument_type(&self) -> SacInstrument {
+        self.iinst.into()
+    }
+    /// Set Instrument Type
+    ///
+    /// This type is historical, you probably want SacStrings::Instrument
+    ///
+    pub fn set_instrument_type(&mut self, itype: SacInstrument) {
+        self.iinst = itype.into();
+    }
+
+    /// Set Amplitude Type (idep)
+    pub fn set_amp_type(&mut self, amp_type: SacDataType) {
+        self.idep = amp_type.into();
+    }
+    /// Compute Distance and Azimuth between station and event
+    pub fn compute_dist_az(&mut self) {
+        if ! self.calc_dist_az() {
+            return;
+        }
+        if fis(self.stlo) && fis(self.stla) && fis(self.evlo) && fis(self.evla) {
+            let g = Geodesic::wgs84();
+            let (a12, s12, az1, az2) = g.inverse(self.stla as f64, self.stlo as f64,
+                                                 self.evla as f64, self.evlo as f64);
+            self.gcarc = a12 as f32;
+            self.dist  = (s12 / 1000.0) as f32;
+            self.az    = az1 as f32;
+            self.baz   = az2 as f32;
+        }
+    }
+    /// Get event region
+    pub fn event_region(&self) -> i32 {
+        self.ievreg
+    }
+    /// Get station region
+    pub fn station_region(&self) -> i32 {
+        self.istreg
+    }
+    /// Update event and station regions
+    ///
+    /// This assumes the station and event locations are defined
+    pub fn update_regions(&mut self) {
+        use flinn_engdahl as fe;
+        if fis(self.stlo) && fis(self.stla) {
+            if let Ok(n) = fe::region_number(self.stla as f64,
+                                             self.stlo as f64) {
+                self.istreg = n as i32;
+            }
+        }
+        if fis(self.evlo) && fis(self.evla) {
+            if let Ok(n) = fe::region_number(self.evla as f64,
+                                             self.evlo as f64) {
+                self.ievreg = n as i32;
+            }
+        }
+    }
+
+    /// Get Current filename
+    pub fn filename(&self) -> &str {
+        &self.file
+    }
+    /// Set Filename
+    pub fn set_filename(&mut self, filename: &str) {
+        self.file = filename.to_string();
+    }
+    pub fn id(&self, key: SacInt) -> i32 {
         match key {
-            "a" | "A" => Some(self.a),
-            "f" | "F" => Some(self.f),
-            _ => None
+            SacInt::OriginID => self.norid,
+            SacInt::EventID => self.nevid,
+            SacInt::WaveformID => self.nwfid,
         }
     }
-}
-use std::ops;
-
-/* Missing Neg */
-
-/* A op B */
-fn f32add (a:f32,b:f32)->f32 {a+b}
-fn f32sub (a:f32,b:f32)->f32 {a-b}
-fn f32mul (a:f32,b:f32)->f32 {a*b}
-fn f32div (a:f32,b:f32)->f32 {a/b}
-/* B op A */
-fn f32addi(a:f32,b:f32)->f32 {b+a}
-fn f32subi(a:f32,b:f32)->f32 {b-a}
-fn f32muli(a:f32,b:f32)->f32 {b*a}
-fn f32divi(a:f32,b:f32)->f32 {b/a}
-
-fn sac_op_sac<F>(s1: Sac, s2: Sac, f: F) -> Sac where F: Fn(f32,f32) -> f32 {
-    let mut s = s1.clone();
-    let npts = s.npts as usize;
-    for i in 0 .. npts {
-        s.y[i] = f(s.y[i], s2.y[i]);
+    pub fn set_id(&mut self, key: SacInt, value: i32) {
+        match key {
+            SacInt::OriginID   => self.norid = value,
+            SacInt::EventID    => self.nevid = value,
+            SacInt::WaveformID => self.nwfid = value,
+        }
     }
-    s.extrema_amp();
-    return s;
-}
-fn sac_op_f32<F>(x: Sac, fval: f32, f: F) -> Sac where F: Fn(f32,f32) -> f32 {
-    let mut s = x.clone();
-    for v in s.y.iter_mut() {
-        *v = f(*v, fval);
+    pub fn string(&self, key: SacString) -> &str {
+        match key {
+            SacString::Station     => &self.kstnm,
+            SacString::EventName   => &self.kevnm,
+            SacString::Hole        => &self.khole,
+            SacString::Location    => &self.khole,
+            SacString::O           => &self.ko,
+            SacString::A           => &self.ka,
+            SacString::T0          => &self.kt0,
+            SacString::T1          => &self.kt1,
+            SacString::T2          => &self.kt2,
+            SacString::T3          => &self.kt3,
+            SacString::T4          => &self.kt4,
+            SacString::T5          => &self.kt5,
+            SacString::T6          => &self.kt6,
+            SacString::T7          => &self.kt7,
+            SacString::T8          => &self.kt8,
+            SacString::T9          => &self.kt9,
+            SacString::EventEnd    => &self.kf,
+            SacString::User0       => &self.kuser0,
+            SacString::User1       => &self.kuser1,
+            SacString::User2       => &self.kuser2,
+            SacString::Component   => &self.kcmpnm,
+            SacString::Network     => &self.knetwk,
+            SacString::DateRead    => &self.kdatrd,
+            SacString::Instrument  => &self.kinst,
+        }
     }
-    s.extrema_amp();
-    return s;
-}
+    pub fn set_string(&mut self, key: SacString, value: &str) {
+        let v = match key {
+            SacString::Station     => &mut self.kstnm,
+            SacString::EventName   => &mut self.kevnm,
+            SacString::Hole        => &mut self.khole,
+            SacString::Location    => &mut self.khole,
+            SacString::O           => &mut self.ko,
+            SacString::A           => &mut self.ka,
+            SacString::T0          => &mut self.kt0,
+            SacString::T1          => &mut self.kt1,
+            SacString::T2          => &mut self.kt2,
+            SacString::T3          => &mut self.kt3,
+            SacString::T4          => &mut self.kt4,
+            SacString::T5          => &mut self.kt5,
+            SacString::T6          => &mut self.kt6,
+            SacString::T7          => &mut self.kt7,
+            SacString::T8          => &mut self.kt8,
+            SacString::T9          => &mut self.kt9,
+            SacString::EventEnd    => &mut self.kf,
+            SacString::User0       => &mut self.kuser0,
+            SacString::User1       => &mut self.kuser1,
+            SacString::User2       => &mut self.kuser2,
+            SacString::Component   => &mut self.kcmpnm,
+            SacString::Network     => &mut self.knetwk,
+            SacString::DateRead    => &mut self.kdatrd,
+            SacString::Instrument  => &mut self.kinst,
+        };
+        *v = value.to_string();
+    }
+    /// Get Sampling 
+    pub fn delta(&self) -> f32 { self.delta  }
+    /// Get Mean amplitude value
+    pub fn mean_amp(&self)  -> f32 { self.depmen }
+    /// Get Minimum amplitude value
+    pub fn min_amp(&self)   -> f32 { self.depmin }
+    /// Get Maximum amplitude value
+    pub fn max_amp(&self)   -> f32 { self.depmax }
 
-impl ops::Add<Sac> for f32 {    type Output = Sac;
-    fn add(self, x: Sac) -> Sac { sac_op_f32(x, self, f32addi) }
-}
-impl ops::Sub<Sac> for f32 {    type Output = Sac;
-    fn sub(self, x: Sac) -> Sac { sac_op_f32(x, self, f32subi) }
-}
-impl ops::Mul<Sac> for f32 {    type Output = Sac;
-    fn mul(self, x: Sac) -> Sac { sac_op_f32(x, self, f32muli) }
-}
-impl ops::Div<Sac> for f32 {    type Output = Sac;
-    fn div(self, x: Sac) -> Sac { sac_op_f32(x, self, f32divi) }
-}
+    pub fn station_lat(&self) -> f32 { self.stla }
+    pub fn station_lon(&self) -> f32 { self.stlo }
+    pub fn station_elevation(&self) -> f32 { self.stel }
+    pub fn event_lat(&self)   -> f32 { self.evla }
+    pub fn event_lon(&self)   -> f32 { self.evlo }
+    pub fn event_depth(&self) -> f32 { self.evdp }
+    pub fn dist_km(&self) -> f32 { self.dist }
+    pub fn dist_deg(&self) -> f32  { self.gcarc }
+    pub fn az(&self) -> f32 { self.az }
+    pub fn baz(&self) -> f32 { self.baz }
+    pub fn set_station_location(&mut self, lat: f32, lon: f32, elev: f32) -> Result<(),SacError>{
+        if lat.abs() > 90.0 {
+            return Err(SacError::BadLatitude);
+        }
+        if lon.abs() > 360.0 {
+            return Err(SacError::BadLongitude);
+        }
+        self.stla = lat;
+        self.stlo = lon;
+        self.stel = elev;
+        self.update_regions();
+        self.compute_dist_az();
+        Ok(())
+    }
+    pub fn set_event_location(&mut self, lat: f32, lon: f32, depth: f32) -> Result<(),SacError>{
+        if lat.abs() > 90.0 {
+            return Err(SacError::BadLatitude);
+        }
+        if lon.abs() > 360.0 {
+            return Err(SacError::BadLongitude);
+        }
+        self.evla = lat;
+        self.evlo = lon;
+        self.evel = depth;
+        self.update_regions();
+        self.compute_dist_az();
+        Ok(())
+    }
+    /// Get Component Azimuth
+    ///
+    /// North is 0 degrees, with positive values rotating clockwise.
+    /// This is a geographic coordinate system.
+    ///
+    ///  Direction | Value
+    ///  ----------|------
+    ///   North    |   0
+    ///   East     |  90
+    ///   South    | 180
+    ///   West     | 270 or -90
+    ///
+    pub fn cmpaz(&self) -> f32 {
+        self.cmpaz
+    }
+    /// Set Component Azimuth
+    ///
+    /// Accepted must be between [-360, 360]
+    ///
+    pub fn set_cmpaz(&mut self, az: f32) -> Result<(),SacError> {
+        if az.abs() > 360.0 {
+            return Err(SacError::BadAzimuth);
+        }
+        self.cmpaz = az;
+        Ok(())
+    }
+    /// Get Component Inclination or Incident angle
+    ///
+    /// Values are defined from vertical
+    ///
+    ///  Diretion    | Value
+    ///  ------------|------
+    ///  Vertical Up | 0
+    ///  Horizontal  | 90
+    ///
+    pub fn cmpinc(&self) -> f32 {
+        self.cmpaz
+    }
+    /// Set Component Inclination
+    ///
+    /// Values must be between [-180, 180]
+    pub fn set_cmpinc(&mut self, inc: f32) -> Result<(),SacError> {
+        if inc.abs() > 180.0 {
+            return Err(SacError::BadInclination)
+        }
+        self.cmpinc = inc;
+        Ok(())
+    }
+    /// Get Beginning time value
+    pub fn b(&self) -> f32 { self.b }
+    /// Get Ending time value
+    pub fn e(&self) -> f32 { self.e }
+    /// Get Origin time value
+    pub fn o(&self) -> f32 { self.o }
 
-/* OP ASSIGN */
-impl ops::AddAssign<f32> for Sac {
-    fn add_assign(&mut self, x: f32) {
-        self.y.iter_mut().for_each(|y| *y += x);
-    }
-}
-impl ops::SubAssign<f32> for Sac {
-    fn sub_assign(&mut self, x: f32) {
-        self.y.iter_mut().for_each(|y| *y -= x);
-    }
-}
-impl ops::MulAssign<f32> for Sac {
-    fn mul_assign(&mut self, x: f32) {
-        self.y.iter_mut().for_each(|y| *y *= x);
-    }
-}
-impl ops::DivAssign<f32> for Sac {
-    fn div_assign(&mut self, x: f32) {
-        match self.iftype.into() {
-            SacFileType::RealImag => {
-                self.y.iter_mut().for_each(|v| *v /= x);
-                self.x.iter_mut().for_each(|v| *v /= x);
+    /// Set beginning time value
+    pub fn set_b(&mut self, time: TimeValue) {
+        match time {
+            TimeValue::Relative(v) => self.b = duration_to_f64(v) as f32,
+            TimeValue::Absolute(v) => {
+                // Requires knowledge of the reference time
+                let dt = self.time() - v;
+                self.b = duration_to_f64(dt) as f32;
             },
-            SacFileType::Time |
-            SacFileType::XY |
-            SacFileType::AmpPhase |
-            SacFileType::XYZ => self.y.iter_mut().for_each(|v| *v /= x),
+        }
+        self.calc_be();
+    }
+    /// Set origin time value
+    pub fn set_o(&mut self, time: TimeValue) {
+        match time {
+            TimeValue::Relative(v) => self.o = duration_to_f64(v) as f32,
+            TimeValue::Absolute(v) => {
+                // Requires knowledge of the reference time
+                let dt = self.time() - v;
+                self.o = duration_to_f64(dt) as f32;
+            }
         }
     }
 }
 
-/* SAC op SAC */
-impl ops::Add<Sac> for Sac {    type Output = Sac;
-    fn add(self, x: Sac) -> Sac { sac_op_sac(self, x, f32add) }
-}
-impl ops::Sub<Sac> for Sac {    type Output = Sac;
-    fn sub(self, x: Sac) -> Sac { sac_op_sac(self, x, f32sub) }
-}
-impl ops::Mul<Sac> for Sac {    type Output = Sac;
-    fn mul(self, x: Sac) -> Sac { sac_op_sac(self, x, f32mul) }
-}
-impl ops::Div<Sac> for Sac {    type Output = Sac;
-    fn div(self, x: Sac) -> Sac { sac_op_sac(self, x, f32div) }
-}
-
-/* SAC op F32 */
-impl ops::Add<f32> for Sac {    type Output = Sac;
-    fn add(self, x: f32) -> Sac { sac_op_f32(self, x, f32add) }
-}
-impl ops::Sub<f32> for Sac {    type Output = Sac;
-    fn sub(self, x: f32) -> Sac { sac_op_f32(self, x, f32sub) }
-}
-impl ops::Mul<f32> for Sac {    type Output = Sac;
-    fn mul(self, x: f32) -> Sac { sac_op_f32(self, x, f32mul) }
-}
-impl ops::Div<f32> for Sac {    type Output = Sac;
-    fn div(self, x: f32) -> Sac { sac_op_f32(self, x, f32div) }
-}
-/* Neg SAC */
-impl ops::Neg for Sac { type Output = Sac;
-    fn neg(self) -> Sac { sac_op_f32(self, -1.0, f32mul) }
-}
 
 
 #[cfg(test)]
@@ -713,119 +1119,30 @@ mod tests {
 
     #[test]
     fn test_finite_ok() {
-        let s = Sac::from_amp_with_name(vec![1.,2.,3.], 0., 1., "finite_ok");
+        let s = Sac::from_amp(vec![1.,2.,3.], 0., 1.);
         assert!(s.is_finite())
     }
     #[test]
     fn test_finite_pos_inf() {
-        let s = Sac::from_amp_with_name(vec![1.,2.,1./0.], 0., 1., "finite_nan");
+        let s = Sac::from_amp(vec![1.,2.,1./0.], 0., 1.);
         assert!(!s.is_finite())
     }
     #[test]
     fn test_finite_neg_inf() {
-        let s = Sac::from_amp_with_name(vec![1.,2.,-1./0.], 0., 1., "finite_neg_nan");
+        let s = Sac::from_amp(vec![1.,2.,-1./0.], 0., 1.);
         assert!(!s.is_finite())
     }
-    #[test]
-    fn test_neg() {
-        let mut s = Sac::from_amp_with_name(vec![1.,2.,3.], 0., 1., "neg");
-        s = -s;
-        assert_eq!(s.y, [-1.,-2.,-3.]);
-    }
-    #[test]
-    fn test_add() {
-        let s = Sac::from_amp_with_name(vec![1.,2.,3.], 0.0, 1.0, "add_s #1");
-        assert_eq!(s.y, [1.,2.,3.]);
-        let mut s1 = s + 1.0;
-        s1.file = String::from("test_add_s+1");
-        assert_eq!(s1.y, [2.,3.,4.]);
 
-        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
-        s.file = String::from("test_add_s #2");
-        assert_eq!(s.y, [1.,2.,3.]);
-        let mut s1 = 1.0 + s;
-        s1.file = String::from("test_add_1+s");
-        assert_eq!(s1.y, [2.,3.,4.]);
-    }
-
-    #[test]
-    fn test_add_vec() {
-        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
-        let mut t = Sac::from_amp(vec![2.,3.,4.], 0.0, 1.0);
-        s.file = String::from("test_add_vec s");
-        t.file = String::from("test_add_vec t");
-        assert_eq!(s.y, [1.,2.,3.]);
-        let mut s1 = s + t;
-        s1.file = String::from("test_add_vec s+t");
-        assert_eq!(s1.y, [3.,5.,7.]);
-
-        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
-        s.file = String::from("test_add_vec s clone?");
-        let mut s1 = s.clone() + s;
-        s1.file = String::from("test_add_vec s1");
-        assert_eq!(s1.y, [2.,4.,6.]);
-    }
-    #[test]
-    fn test_sub() {
-        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
-        s.file = String::from("test_sub s");
-        assert_eq!(s.y, [1.,2.,3.]);
-        let mut s1 = s - 1.0;
-        s1.file = String::from("test_sub s1");
-        assert_eq!(s1.y, [0.,1.,2.]);
-    }
-    #[test]
-    fn test_mul() {
-        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
-        s.file = String::from("test_mul s");
-        assert_eq!(s.y, [1.,2.,3.]);
-        let mut s1 = s * 2.0;
-        s1.file = String::from("test_mul s1");
-        assert_eq!(s1.y, [2.,4.,6.]);
-    }
-    #[test]
-    fn test_div() {
-        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
-        s.file = String::from("test_div s");
-        assert_eq!(s.y, [1.,2.,3.]);
-        let mut s1 = s / 2.0;
-        s1.file = String::from("test_div s1");
-        assert_eq!(s1.y, [0.5,1.,1.5]);
-    }
-    #[test]
-    fn test_clone() {
-        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
-        s.file = String::from("test_clone s");
-        let mut cc = s.clone();
-        cc.file = String::from("test_clone cc");
-        let mut s1 = s / 2.0;
-        s1.file = String::from("test_clone s1");
-        assert_eq!(s1.y, [0.5,1.,1.5]);
-        assert_eq!(cc.y, [1.,2.,3.]);
-    }
-    #[test]
-    fn test_assign_op() {
-        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
-        s.file = String::from("test_clone s");
-        s += 1.0;
-        assert_eq!(s.y, [2.,3.,4.]);
-        s *= 2.0;
-        assert_eq!(s.y, [4.,6.,8.]);
-        s -= 3.0;
-        assert_eq!(s.y, [1.,3.,5.]);
-        s /= 2.0;
-        assert_eq!(s.y, [0.5,1.5,2.5]);
-    }
 
     #[test]
     fn read_file() {
         use std::path::Path;
-        let mut s = Sac::read("tests/file.sac.swap").unwrap();
+        let mut s = Sac::from_file("tests/file.sac.swap").unwrap();
         s.file = String::from("tests/file.sac.swap");
 
         let mut s0 = Sac::new();
         s0.file = String::from("tests/file.sac.swap true");
-        s0.set_time(1981, 88, 10, 38, 14, 0);
+        s0.set_time(time_from_parts(1981, 88, 10, 38, 14, 0));
         s0.norid  = 0;
         s0.nevid  = 0;
 
@@ -870,46 +1187,68 @@ mod tests {
         println!("compare s and s0");
         assert_eq!(s,s0);
         println!("write file");
-        let path = Path::new("tmp.sac");
-        s.write(path.to_path_buf()).unwrap();
+        let path = Path::new("tests/tmp.sac");
+        s.to_file(path).unwrap();
 
         println!("write file with long kevnm");
         s.kevnm = format!("{}", "123456789012345678901234567890");
-        let path = Path::new("tmp2.sac");
-        s.write(path.to_path_buf()).unwrap();
+        let path = Path::new("tests/tmp2.sac");
+        s.to_file(path).unwrap();
 
         println!("write file with short kevnm");
         s.kevnm = format!("{}", "12");
-        let path = Path::new("tmp3.sac");
-        s.write(path.to_path_buf()).unwrap();
+        let path = Path::new("tests/tmp3.sac");
+        s.to_file(path).unwrap();
         {
             for elem in s.y.iter_mut() {
                 *elem += 1.0;
             }
         }
     }
+    #[test]
+    fn stringy() {
+        let mut s = Sac::new();
+        s.set_string(SacString::Network, "IU");
+        assert!(s.string(SacString::Network) == "IU");
+    }
 
 }
 
 /// SAC file data and metadata
 ///
-///
-#[derive(Clone, Default)]
-#[repr(C)]
+#[derive(Default, Clone)]
 pub struct Sac {
+    /// Dependent variable
+    ///   - Amplitude for time series data
+    ///   - Amplitude for Amplitude Phase data
+    ///   - Real for Real Imaginary data
+    ///   - Z for XYZ data
+    ///   - Y for XY data
+    pub y: Vec<f32>,
+    /// Indepenent variable, Time for time series data
+    ///   - Timing for time series data, only for uneven data
+    ///   - Phase for Amplitude Phase data
+    ///   - Imaginary for Real Imaginary data
+    ///   - X for XY data
+    pub x: Vec<f32>,
+    /// Filename of the Sac Data File
+    pub file: String,
+    /// If data is swapped from native byte order
+    swap: bool,
+
     /// Time sampling
-    pub delta: f32,               /* RF time increment, sec    */
+    delta: f32,               /* RF time increment, sec    */
     /// Miniumum Value of y
-    pub depmin: f32,               /*    minimum amplitude      */
+    depmin: f32,               /*    minimum amplitude      */
     /// Maximum value of y
-    pub depmax: f32,               /*    maximum amplitude      */
-    pub scale: f32,                /*    amplitude scale factor */
-    pub odelta: f32,               /*    observed time inc      */
+    depmax: f32,               /*    maximum amplitude      */
+    scale: f32,                /*    amplitude scale factor */
+    odelta: f32,               /*    observed time inc      */
     /// Begin time value of the data
-    pub b: f32,                    /* RD initial value, time    */
+    b: f32,                    /* RD initial value, time    */
     /// End time value of the data
-    pub e: f32,                    /* RD final value, time      */
-    pub o: f32,                    /*    event start, sec < nz. */
+    e: f32,                    /* RD final value, time      */
+    o: f32,                    /*    event start, sec < nz. */
     pub a: f32,                    /*    1st arrival time       */
     pub fmt: f32,                  /*    internal use           */
     pub t0: f32,                   /*    user-defined time pick */
@@ -933,14 +1272,14 @@ pub struct Sac {
     pub resp7: f32,                /*    instrument respnse parm */
     pub resp8: f32,                /*    instrument respnse parm */
     pub resp9: f32,                /*    instrument respnse parm */
-    pub stla: f32,                 /*  T station latititude     */
-    pub stlo: f32,                 /*  T station longitude      */
-    pub stel: f32,                 /*  T station elevation, m   */
-    pub stdp: f32,                 /*  T station depth, m      */
-    pub evla: f32,                 /*    event latitude         */
-    pub evlo: f32,                 /*    event longitude        */
-    pub evel: f32,                 /*    event elevation        */
-    pub evdp: f32,                 /*    event depth            */
+    stla: f32,                 /*  T station latititude     */
+    stlo: f32,                 /*  T station longitude      */
+    stel: f32,                 /*  T station elevation, m   */
+    stdp: f32,                 /*  T station depth, m      */
+    evla: f32,                 /*    event latitude         */
+    evlo: f32,                 /*    event longitude        */
+    evel: f32,                 /*    event elevation        */
+    evdp: f32,                 /*    event depth            */
     pub mag: f32,                  /*    reserved for future use */
     pub user0: f32,                /*    available to user      */
     pub user1: f32,                /*    available to user      */
@@ -952,19 +1291,19 @@ pub struct Sac {
     pub user7: f32,                /*    available to user      */
     pub user8: f32,                /*    available to user      */
     pub user9: f32,                /*    available to user      */
-    pub dist: f32,                 /*    stn-event distance, km */
-    pub az: f32,                   /*    event-stn azimuth      */
-    pub baz: f32,                  /*    stn-event azimuth      */
-    pub gcarc: f32,                /*    stn-event dist, degrees */
-    pub sb: f32,                   /*    internal use           */
-    pub sdelta: f32,               /*    internal use           */
-    pub depmen: f32,               /*    mean value, amplitude  */
-    pub cmpaz: f32,                /*  T component azimuth     */
-    pub cmpinc: f32,               /*  T component inclination */
-    pub xminimum: f32,             /*    reserved for future use */
-    pub xmaximum: f32,             /*    reserved for future use */
-    pub yminimum: f32,             /*    reserved for future use */
-    pub ymaximum: f32,             /*    reserved for future use */
+    dist: f32,                 /*    stn-event distance, km */
+    az: f32,                   /*    event-stn azimuth      */
+    baz: f32,                  /*    stn-event azimuth      */
+    gcarc: f32,                /*    stn-event dist, degrees */
+    sb: f32,                   /*    internal use           */
+    sdelta: f32,               /*    internal use           */
+    depmen: f32,               /*    mean value, amplitude  */
+    cmpaz: f32,                /*  T component azimuth     */
+    cmpinc: f32,               /*  T component inclination */
+    xminimum: f32,             /*    reserved for future use */
+    xmaximum: f32,             /*    reserved for future use */
+    yminimum: f32,             /*    reserved for future use */
+    ymaximum: f32,             /*    reserved for future use */
     unused6: f32,              /*    reserved for future use */
     unused7: f32,              /*    reserved for future use */
     unused8: f32,              /*    reserved for future use */
@@ -972,35 +1311,37 @@ pub struct Sac {
     unused10: f32,             /*    reserved for future use */
     unused11: f32,             /*    reserved for future use */
     unused12: f32,             /*    reserved for future use */
-    pub nzyear: i32,                 /*  F zero time of file, yr  */
-    pub nzjday: i32,                 /*  F zero time of file, day */
-    pub nzhour: i32,                 /*  F zero time of file, hr  */
-    pub nzmin: i32,                  /*  F zero time of file, min */
-    pub nzsec: i32,                  /*  F zero time of file, sec */
-    pub nzmsec: i32,                 /*  F zero time of file, msec */
+    nzyear: i32,                 /*  F zero time of file, yr  */
+    nzjday: i32,                 /*  F zero time of file, day */
+    nzhour: i32,                 /*  F zero time of file, hr  */
+    nzmin: i32,                  /*  F zero time of file, min */
+    nzsec: i32,                  /*  F zero time of file, sec */
+    nzmsec: i32,                 /*  F zero time of file, msec */
     /// Header Version, Should be 6
-    pub nvhdr: i32,                  /*    internal use           */
-    pub norid: i32,                  /*    origin ID              */
-    pub nevid: i32,                  /*    event ID               */
+    nvhdr: i32,                  /*    internal use           */
+    norid: i32,                  /*    origin ID              */
+    nevid: i32,                  /*    event ID               */
     /// Number of data points
-    pub npts: i32,                   /* RF number of samples      */
-    pub nsnpts: i32,                 /*    internal use           */
-    pub nwfid: i32,                  /*    waveform ID            */
-    pub nxsize: i32,                 /*    reserved for future use */
-    pub nysize: i32,                 /*    reserved for future use */
+    npts: i32,                   /* RF number of samples      */
+    nsnpts: i32,                 /*    internal use           */
+    nwfid: i32,                  /*    waveform ID            */
+    nxsize: i32,                 /*    reserved for future use */
+    nysize: i32,                 /*    reserved for future use */
     unused15: i32,               /*    reserved for future use */
-    pub iftype: i32,                 /* RA type of file          */
-    pub idep: i32,                   /*    type of amplitude      */
-    pub iztype: i32,                 /*    zero time equivalence  */
+    /// file_type(), set_file_type(), is_amp_phase(), is_real_imag(), is_spectral()
+    iftype: i32,                 /* RA type of file          */
+    /// amp_type(), set_amp_type()
+    idep: i32,                   /*    type of amplitude      */
+    iztype: i32,                 /*    zero time equivalence  */
     unused16: i32,               /*    reserved for future use */
-    pub iinst: i32,                  /*    recording instrument   */
-    pub istreg: i32,                 /*    stn geographic region  */
-    pub ievreg: i32,                 /*    event geographic region */
-    pub ievtyp: i32,                 /*    event type             */
-    pub iqual: i32,                  /*    quality of data        */
-    pub isynth: i32,                 /*    synthetic data flag    */
-    pub imagtyp: i32,                /*    reserved for future use */
-    pub imagsrc: i32,                /*    reserved for future use */
+    iinst: i32,                  /*    recording instrument   */
+    istreg: i32,                 /*    stn geographic region  */
+    ievreg: i32,                 /*    event geographic region */
+    ievtyp: i32,                 /*    event type             */
+    iqual: i32,                  /*    quality of data        */
+    isynth: i32,                 /*    synthetic data flag    */
+    imagtyp: i32,                /*    reserved for future use */
+    imagsrc: i32,                /*    reserved for future use */
     unused19: i32,               /*    reserved for future use */
     unused20: i32,               /*    reserved for future use */
     unused21: i32,               /*    reserved for future use */
@@ -1009,10 +1350,10 @@ pub struct Sac {
     unused24: i32,               /*    reserved for future use */
     unused25: i32,               /*    reserved for future use */
     unused26: i32,               /*    reserved for future use */
-    pub leven: i32,                  /* RA data-evenly-spaced flag */
-    pub lpspol: i32,                 /*    station polarity flag  */
-    pub lovrok: i32,                 /*    overwrite permission   */
-    pub lcalda: i32,                 /*    calc distance, azimuth */
+    leven: i32,                  /* RA data-evenly-spaced flag */
+    lpspol: i32,                 /*    station polarity flag  */
+    lovrok: i32,                 /*    overwrite permission   */
+    lcalda: i32,                 /*    calc distance, azimuth */
     unused27: i32,               /*    reserved for future use */
 
     u8_kstnm: [u8; 8],              /*  F station name           */
@@ -1039,48 +1380,132 @@ pub struct Sac {
     u8_kdatrd: [u8; 8],             /*    date data read         */
     u8_kinst: [u8; 8],              /*    instrument name        */
 
-    pub kstnm: String,              /*  F station name           */
-    pub kevnm: String,             /*    event name             */
-    pub khole: String,              /*    man-made event name    */
-    pub ko: String,                 /*    event origin time id   */
-    pub ka: String,                 /*    1st arrival time ident */
-    pub kt0: String,                /*    time pick 0 ident      */
-    pub kt1: String,                /*    time pick 1 ident      */
-    pub kt2: String,                /*    time pick 2 ident      */
-    pub kt3: String,                /*    time pick 3 ident      */
-    pub kt4: String,                /*    time pick 4 ident      */
-    pub kt5: String,                /*    time pick 5 ident      */
-    pub kt6: String,                /*    time pick 6 ident      */
-    pub kt7: String,                /*    time pick 7 ident      */
-    pub kt8: String,                /*    time pick 8 ident      */
-    pub kt9: String,                /*    time pick 9 ident      */
-    pub kf: String,                 /*    end of event ident     */
-    pub kuser0: String,             /*    available to user      */
-    pub kuser1: String,             /*    available to user      */
-    pub kuser2: String,             /*    available to user      */
-    pub kcmpnm: String,             /*  F component name         */
-    pub knetwk: String,             /*    network name           */
-    pub kdatrd: String,             /*    date data read         */
-    pub kinst: String,              /*    instrument name        */
+    /* End of Tradiitonal Header */
+    kstnm: String,              /*  F station name           */
+    kevnm: String,             /*    event name             */
+    khole: String,              /*    man-made event name    */
+    ko: String,                 /*    event origin time id   */
+    ka: String,                 /*    1st arrival time ident */
+    kt0: String,                /*    time pick 0 ident      */
+    kt1: String,                /*    time pick 1 ident      */
+    kt2: String,                /*    time pick 2 ident      */
+    kt3: String,                /*    time pick 3 ident      */
+    kt4: String,                /*    time pick 4 ident      */
+    kt5: String,                /*    time pick 5 ident      */
+    kt6: String,                /*    time pick 6 ident      */
+    kt7: String,                /*    time pick 7 ident      */
+    kt8: String,                /*    time pick 8 ident      */
+    kt9: String,                /*    time pick 9 ident      */
+    kf: String,                 /*    end of event ident     */
+    kuser0: String,             /*    available to user      */
+    kuser1: String,             /*    available to user      */
+    kuser2: String,             /*    available to user      */
+    kcmpnm: String,             /*  F component name         */
+    knetwk: String,             /*    network name           */
+    kdatrd: String,             /*    date data read         */
+    kinst: String,              /*    instrument name        */
 
 
-    /// Dependent variable
-    ///   - Amplitude for time series data
-    ///   - Amplitude for Amplitude Phase data
-    ///   - Real for Real Imaginary data
-    ///   - Z for XYZ data
-    ///   - Y for XY data
-    pub y: Vec<f32>,
-    /// Indepenent variable, Time for time series data
-    ///   - Timing for time series data, only for uneven data
-    ///   - Phase for Amplitude Phase data
-    ///   - Imaginary for Real Imaginary data
-    ///   - X for XY data
-    pub x: Vec<f32>,
-    /// Filename of the Sac Data File
-    pub file: String,
-    /// If data is swapped from native byte order
-    pub swap: bool,
 }
 
 
+/*
+/// String formatting of sac header data
+fn strfmt(s: &Sac, fmt: &str) -> String {
+    let mut out = String::new();
+    let mut b = fmt.chars();
+    let t = s.time();
+    while let Some(p) = b.next() {
+        if p == '%' {
+            if let Some(p2) = b.next() {
+                match p2 {
+                    '%' => out.push('%'),
+                    '+' => {
+                        if s.nzyear == SAC_INT_UNDEF || s.nzjday == SAC_INT_UNDEF ||
+                            s.nzhour == SAC_INT_UNDEF || s.nzmin == SAC_INT_UNDEF ||
+                            s.nzsec == SAC_INT_UNDEF { continue; }
+                        out += & strfmt(s, "%Y-%m-%dT%H:%M:%S.%f");
+                    }
+                    'Y' => vore!(s.nzyear, out, "{:04}", i),
+                    'J' => vore!(s.nzjday, out, "{:02}", i),
+                    'd' => vore!(t.ordinal(),   out, "{:02}", i),
+                    'm' => vore!(t.month(), out, "{:02}", i),
+                    'H' => vore!(s.nzhour, out, "{:02}",i),
+                    'M' => vore!(s.nzmin, out, "{:02}", i),
+                    'S' => vore!(s.nzsec, out, "{:02}", i),
+                    'f' => vore!(s.nzmsec, out, "{:03}", i),
+
+                    'n' => out += vore!(&s.knetwk, c),
+                    's' => out += vore!(&s.kstnm, c),
+                    'l' => out += vore!(&s.khole, c),
+                    'c' => out += vore!(&s.kcmpnm, c),
+                    'I' => out += &strfmt(s, "%n.%s.%l.%c"),
+
+                    _ => {},
+                }
+            } else {
+                out.push(p);
+                break;
+            }
+        } else {
+            out.push(p);
+        }
+
+    }
+    out
+}
+
+    #[test]
+    fn fmt() {
+        println!("time");
+        let mut s = Sac::from_amp(vec![1.,2.,3.], 0.0, 1.0);
+        println!("time");
+        let f = strfmt(&s, "thing");
+        println!("time");
+        assert_eq!(f, "thing");
+        let f = strfmt(&s, "thing%Y-%m-%dT%H:%M:%S");
+        assert_eq!(f, "thing--T::");
+        println!("time");
+        let f = strfmt(&s, "thing%+");
+        assert_eq!(f, "thing");
+
+        s.set_time(Time::new(1976, 27, 03, 23, 0,  23).unwrap());
+        let f = strfmt(&s, "thing%Y-%m-%dT%H:%M:%S");
+        assert_eq!(f, "thing1976-01-27T03:23:00");
+        let f = strfmt(&s, "thing%+");
+        assert_eq!(f, "thing1976-01-27T03:23:00.023");
+
+        let f = strfmt(&s, "thing%n%s%l%c");
+        assert_eq!(f, "thing");
+        let f = strfmt(&s, "thing%I");
+        assert_eq!(f, "thing...");
+
+        s.kstnm = "PAS".to_string();
+        s.knetwk = "CI".to_string();
+        s.khole= "00".to_string();
+        s.kcmpnm= "BHZ".to_string();
+        let f = strfmt(&s, "thing%n%s%l%c");
+        assert_eq!(f, "thingCIPAS00BHZ");
+        let f = strfmt(&s, "thing%I");
+        assert_eq!(f, "thingCI.PAS.00.BHZ");
+
+        let f = strfmt(&s, "thing%x");
+        assert_eq!(f, "thing");
+        s.stlo = 40.1234;
+    }
+/// Value Or Empty (v_or_e)
+macro_rules! vore {
+    ($x: expr, $out: expr, $f: expr, i) => {
+        if $x as i32 != SAC_INT_UNDEF {
+            $out += & format!($f, $x);
+        }
+    };
+    ($x: expr, $out: expr, $f: expr, f) => {
+        if $x != SAC_FLOAT_UNDEF {
+            $out += & format!($f, $x);
+        }
+    };
+    ($x: expr, c) => { if $x == SAC_STRING_UNDEF { "" } else { $x } }
+}
+
+*/

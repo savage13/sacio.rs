@@ -1,17 +1,17 @@
 [package]
-name = "sac"
+name = "sacio"
 version = "0.1.0"
 authors = ["Brian Savage <savage@uri.edu>"]
+edition = "2018"
+repository = "https://github.com/savage13/sacio"
+homepage = "https://github.com/savage13/sacio"
+documentation = "https://docs.rs/sacio"
+license = "MIT/X11"
+description = "Library for reading and writing SAC (Seismic Analysis Code) files"
 
 [dependencies]
-num-complex = "0.1"
-failure = "0.1"
-failure_derive = "0.1"
-byteorder = "1.0"
-num-traits = "0.2"
+byteorder     = "1.0"
+geographiclib = "0.1.0"
+flinn_engdahl = "0.1.0"
+chrono        = "0.4.6"
 
-[dependencies.fft]
-path = "../fft"
-
-[dependencies.filter]
-path = "../filter"
