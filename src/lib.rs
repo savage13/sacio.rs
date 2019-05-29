@@ -70,7 +70,7 @@ type __NativeEndian = LittleEndian;
 //const HEADER_SIZE : usize = 632;
 const SAC_INT_UNDEF : i32 = -12345;
 const SAC_FLOAT_UNDEF : f32 = -12345.0;
-const _SAC_STRING_UNDEF : &'static str = "-12345  ";
+const SAC_STRING_UNDEF : &'static str = "-12345  ";
 
 #[inline]
 fn fis(x: f32) -> bool {
@@ -910,6 +910,35 @@ impl Sac {
             SacInt::WaveformID => self.nwfid = value,
         }
     }
+    /// Return a `nslc` code for this data
+    ///  net.stat.loc.chan
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    /// use sacio::SacString;
+    ///
+    /// let mut s = Sac::from_file("tests/file.sac")?;
+    /// s.set_string(SacString::Network, "CI");
+    /// s.set_string(SacString::Station, "PAS");
+    /// s.set_string(SacString::Location, "");
+    /// s.set_string(SacString::Channel, "BHZ");
+    /// assert_eq!(s.nslc(), "CI.PAS..BHZ");
+    /// # Ok::<(), SacError>(())
+    /// ```
+    pub fn nslc(&self) -> String {
+        let mut cmp = [""; 4];
+        let keys = [SacString::Network, SacString::Station,
+                    SacString::Location, SacString::Channel];
+        for (v,c) in keys.iter().zip(cmp.iter_mut()) {
+            let s = self.string(*v);
+            if s != SAC_STRING_UNDEF {
+                *c = s.trim();
+            }
+        }
+        cmp.join(".")
+    }
+
     pub fn string(&self, key: SacString) -> &str {
         match key {
             SacString::Station     => &self.kstnm,
@@ -933,6 +962,7 @@ impl Sac {
             SacString::User1       => &self.kuser1,
             SacString::User2       => &self.kuser2,
             SacString::Component   => &self.kcmpnm,
+            SacString::Channel     => &self.kcmpnm,
             SacString::Network     => &self.knetwk,
             SacString::DateRead    => &self.kdatrd,
             SacString::Instrument  => &self.kinst,
@@ -961,6 +991,7 @@ impl Sac {
             SacString::User1       => &mut self.kuser1,
             SacString::User2       => &mut self.kuser2,
             SacString::Component   => &mut self.kcmpnm,
+            SacString::Channel     => &mut self.kcmpnm,
             SacString::Network     => &mut self.knetwk,
             SacString::DateRead    => &mut self.kdatrd,
             SacString::Instrument  => &mut self.kinst,
@@ -1204,6 +1235,9 @@ mod tests {
                 *elem += 1.0;
             }
         }
+        std::fs::remove_file("tests/tmp.sac").unwrap();
+        std::fs::remove_file("tests/tmp2.sac").unwrap();
+        std::fs::remove_file("tests/tmp3.sac").unwrap();
     }
     #[test]
     fn stringy() {

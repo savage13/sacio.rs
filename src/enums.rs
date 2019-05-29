@@ -456,6 +456,7 @@ pub enum SacInt {
     WaveformID,
 }
 
+#[derive(Debug, Copy, Clone)]
 /// Available String Meta Data
 pub enum SacString {
     /// Station Name
@@ -498,8 +499,10 @@ pub enum SacString {
     User1,
     /// User available String 
     User2,
-    /// Component Name
+    /// Component Name (same as Channel)
     Component,
+    /// Channel Name (same as Component)
+    Channel,
     /// Network Name
     Network,
     /// Date Data was Read
