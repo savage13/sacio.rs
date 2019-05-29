@@ -140,42 +140,63 @@ fn sac_data_write<F: Write>(file: &mut F, s: &mut Sac, npts: usize) -> Result<()
     Ok(())
 }
 
-/// Determine if the sac file is byte swapped
-fn sac_header_is_swapped<T: Read + Seek>(file: &mut T) -> Result<bool,SacError> {
-    use std::io::SeekFrom;
-    file.seek(SeekFrom::Start(70*4 + 6*4))?;
-    let n = file.read_i32::<NativeEndian>()?;
+macro_rules! i32_swap {
+    ($s:ident, $q:ident, $t:ty, $($x:ident),*) => ( $( $s.$x = swap_i32($s.$x); )* );
+}
+macro_rules! f32_swap {
+    ($s:ident, $q:ident, $t:ty, $($x:ident),*) => ( $( $s.$x = swap_f32($s.$x); )* );
+}
 
-    let swap = if n > 5 && n <= 8 {
-        false
-    } else {
-        file.seek(SeekFrom::Start(70*4 + 6*4))?;
-        let n = file.read_i32::<NonNativeEndian>()?;
-        if n < 0 || n > 10 {
-            panic!("Unknown file type: {}", n);
-        }
-        true
-    };
-    file.seek(SeekFrom::Start(0))?;
+fn swap_f32(i: f32) -> f32 {
+    let mut bs = [0u8; std::mem::size_of::<f32>()];
+    bs.as_mut()
+        .write_f32::<NonNativeEndian>(i)
+        .expect("Unable to write");
+    let mut rdr = std::io::Cursor::new(&bs);
+    rdr.read_f32::<NativeEndian>()
+        .expect("Unable to read")
+}
 
-    Ok(swap)
+
+fn swap_i32(i: i32) -> i32 {
+    let mut bs = [0u8; std::mem::size_of::<i32>()];
+    bs.as_mut()
+        .write_i32::<NonNativeEndian>(i)
+        .expect("Unable to write");
+    let mut rdr = std::io::Cursor::new(&bs);
+    rdr.read_i32::<NativeEndian>()
+        .expect("Unable to read")
 }
 
 /// Read a sac file header
-fn sac_header_read<T: Read + Seek>(file: &mut T, h: &mut Sac) -> Result<(),SacError>{
-    use std::io::SeekFrom;
+fn sac_header_read<T: Read>(file: &mut T, h: &mut Sac) -> Result<(),SacError>{
+    //use std::io::SeekFrom;
+    //h.swap = sac_header_is_swapped(file)?;
+    //file.seek(SeekFrom::Start(0))?;
 
-    h.swap = sac_header_is_swapped(file)?;
-    file.seek(SeekFrom::Start(0))?;
-
-    if h.swap {
-        sac_reals!(h, file, NonNativeEndian, read_reals );
-        sac_ints!(h, file, NonNativeEndian, read_ints);
-    } else {
-        sac_reals!(h, file, NativeEndian, read_reals );
-        sac_ints!(h, file, NativeEndian, read_ints);
-    }
+    //if h.swap {
+    //    sac_reals!(h, file, NonNativeEndian, read_reals );
+    //    sac_ints!(h, file, NonNativeEndian, read_ints);
+    //} else {
+    sac_reals!(h, file, NativeEndian, read_reals );
+    sac_ints!(h, file, NativeEndian, read_ints);
+    //}
     sac_u8_strings!(h, file, read_strings);
+
+    dbg!(h.nvhdr);
+    if h.nvhdr > 5 && h.nvhdr <= 8 {
+        h.swap = false;
+    } else {
+        let v = swap_i32(h.nvhdr);
+        dbg!(v);
+        if v < 5 || v > 8 {
+            panic!("Unknown file type: {} {}", h.nvhdr, v);
+        }
+        h.swap = true;
+        sac_ints!(h, i32_swap);
+        sac_reals!(h, f32_swap);
+    }
+
     Ok(())
 }
 
@@ -285,7 +306,7 @@ impl Sac {
     /// assert_eq!(s.delta(), 0.01);
     /// # Ok::<(), SacError>(())
     /// ```
-    pub fn read<R: Read + Seek>(buf: &mut R) -> Result<Sac,SacError> {
+    pub fn read<R: Read>(buf: &mut R) -> Result<Sac,SacError> {
         let mut s = Sac::new();
         sac_header_read(buf, &mut s)?;
         sac_u8_to_strings(&mut s);
