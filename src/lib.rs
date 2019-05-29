@@ -593,6 +593,7 @@ impl Sac {
             "day"  => unimplemented!("Start of day timing"),
             "o"    => self.o,
             "a"    => self.a,
+            "e"    => self.e,
             "t0"   => self.t0,
             "t1"   => self.t1,
             "t2"   => self.t2,
