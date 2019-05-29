@@ -218,6 +218,22 @@ pub enum SacError {
     BadKey,
 }
 
+impl std::fmt::Display for SacError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            SacError::NotSpectral => write!(f, "Not a spectral file"),
+            SacError::NotTime => write!(f, "Not a time value"),
+            SacError::NaN => write!(f, "NaN encountered in data"),
+            SacError::BadLatitude => write!(f, "Invalid Latitude value"),
+            SacError::BadLongitude => write!(f, "Invalid Longitude value"),
+            SacError::BadAzimuth => write!(f, "Invalid Azimuth value"),
+            SacError::BadInclination => write!(f, "Invalid Inclination value"),
+            SacError::BadKey => write!(f, "Invalid key"),
+            SacError::Io(e) => write!(f, "{}", e),
+        }
+    }
+}
+
 /// Wrap an std::io::Error
 impl From<std::io::Error> for SacError {
     fn from(err: std::io::Error) -> Self {
