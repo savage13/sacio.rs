@@ -183,12 +183,10 @@ fn sac_header_read<T: Read>(file: &mut T, h: &mut Sac) -> Result<(),SacError>{
     //}
     sac_u8_strings!(h, file, read_strings);
 
-    dbg!(h.nvhdr);
     if h.nvhdr > 5 && h.nvhdr <= 8 {
         h.swap = false;
     } else {
         let v = swap_i32(h.nvhdr);
-        dbg!(v);
         if v < 5 || v > 8 {
             panic!("Unknown file type: {} {}", h.nvhdr, v);
         }
