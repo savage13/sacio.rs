@@ -76,6 +76,10 @@ const SAC_STRING_UNDEF : &'static str = "-12345  ";
 fn fis(x: f32) -> bool {
     x != SAC_FLOAT_UNDEF
 }
+#[inline]
+fn iis(x: i32) -> bool {
+    x != SAC_INT_UNDEF
+}
 
 #[macro_use] mod macros;
 mod eq;
@@ -526,16 +530,21 @@ impl Sac {
     /// let s = Sac::from_file("tests/file.sac")?;
     /// let date = NaiveDate::from_yo(1981, 88);
     /// let time = NaiveTime::from_hms_milli(10, 38, 14, 0);
-    /// assert_eq!(s.time(), NaiveDateTime::new(date, time));
+    /// assert_eq!(s.time()?, NaiveDateTime::new(date, time));
     /// # Ok::<(), SacError>(())
     /// ```
     ///
-    pub fn time(&self) -> NaiveDateTime {
-        time_from_parts(self.nzyear, self.nzjday,
-                        self.nzhour, self.nzmin, self.nzsec,
-                        self.nzmsec)
+    pub fn time(&self) -> Result<NaiveDateTime, SacError> {
+        if iis(self.nzyear) && iis(self.nzjday) && iis(self.nzhour) &&
+            iis(self.nzmin) && iis(self.nzsec) && iis(self.nzmsec) {
+                Ok(time_from_parts(self.nzyear, self.nzjday,
+                                   self.nzhour, self.nzmin, self.nzsec,
+                                   self.nzmsec))
+            } else {
+                Err(SacError::NotTime)
+            }
     }
-    /// Set Refernce Time
+    /// Set Reference Time
     ///
     /// ```
     /// use sacio::Sac;
@@ -548,7 +557,7 @@ impl Sac {
     /// let when = NaiveDateTime::new(date, time);
     /// s.set_time(when);
     ///
-    /// assert_eq!(s.time(), when);
+    /// assert_eq!(s.time()?, when);
     /// # Ok::<(), SacError>(())
     /// ```
     ///
@@ -560,6 +569,58 @@ impl Sac {
         self.nzsec  = time.second() as i32;
         self.nzmsec = time.nanosecond() as i32 / 1_000_000;
     }
+
+    fn time_as_duration(&self, which: &str) -> Result<Duration, SacError> {
+        let t0 = match which {
+            "z" |
+            "b"    => self.b ,
+            "day"  => unimplemented!("Start of day timing"),
+            "o"    => self.o,
+            "a"    => self.a,
+            "t0"   => self.t0,
+            "t1"   => self.t1,
+            "t2"   => self.t2,
+            "t3"   => self.t3,
+            "t4"   => self.t4,
+            "t5"   => self.t5,
+            "t6"   => self.t6,
+            "t7"   => self.t7,
+            "t8"   => self.t8,
+            "t9"   => self.t9,
+            _ => return Err(SacError::BadKey),
+        };
+        if t0 == SAC_FLOAT_UNDEF {
+            return Err(SacError::NotTime);
+        }
+        Ok(Duration::seconds(t0.trunc() as i64) +
+            Duration::nanoseconds((t0.fract() * 1e9) as i64))
+    }
+
+    /// Get the Date and Time of a timing mark
+    ///
+    /// ```
+    /// use sacio::Sac;
+    /// # use sacio::SacError;
+    /// use chrono::Duration;
+    ///
+    ///
+    /// let mut s = Sac::from_file("tests/file.sac")?;
+    /// let dt = s.time()?;
+    /// let b = s.b();
+    /// assert_eq!(s.b(), 9.459999);
+    /// let bt = dt + Duration::seconds(b.trunc() as i64) +
+    ///               Duration::nanoseconds((b.fract() * 1e9) as i64);
+    /// assert_eq!(s.datetime("b")?, bt);
+    /// assert!(s.datetime("t9").is_err());
+    /// # Ok::<(), SacError>(())
+    /// ```
+    ///
+    pub fn datetime(&self, which: &str) -> Result<NaiveDateTime, SacError> {
+        let tref = self.time()?; // Absolute Reference time
+        let dt = self.time_as_duration(which)?;
+        Ok(tref + dt)
+    }
+
     /// Compute the maximum amplitude
     ///
     /// ```
@@ -1101,27 +1162,29 @@ impl Sac {
     pub fn o(&self) -> f32 { self.o }
 
     /// Set beginning time value
-    pub fn set_b(&mut self, time: TimeValue) {
+    pub fn set_b(&mut self, time: TimeValue) -> Result<(), SacError> {
         match time {
             TimeValue::Relative(v) => self.b = duration_to_f64(v) as f32,
             TimeValue::Absolute(v) => {
                 // Requires knowledge of the reference time
-                let dt = self.time() - v;
+                let dt = self.time()? - v;
                 self.b = duration_to_f64(dt) as f32;
             },
         }
         self.calc_be();
+        Ok(())
     }
     /// Set origin time value
-    pub fn set_o(&mut self, time: TimeValue) {
+    pub fn set_o(&mut self, time: TimeValue) -> Result<(), SacError> {
         match time {
             TimeValue::Relative(v) => self.o = duration_to_f64(v) as f32,
             TimeValue::Absolute(v) => {
                 // Requires knowledge of the reference time
-                let dt = self.time() - v;
+                let dt = self.time()? - v;
                 self.o = duration_to_f64(dt) as f32;
             }
         }
+        Ok(())
     }
 }
 

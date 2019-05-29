@@ -79,6 +79,7 @@ pub enum SacFileType {
 #[repr(i32)]
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum SacZeroTime {
+    /// None, or Data Begin value
     None = IUNDEF,
     /// Begin Time
     B   = IB,
